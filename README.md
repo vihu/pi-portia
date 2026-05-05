@@ -26,20 +26,27 @@ Not implemented yet:
 
 ## Installation
 
-For local development from this checkout:
+Install from GitHub with Pi:
 
 ```bash
-cd /home/rahul/personal/pi-custom/pi-portia
+pi install git:github.com/vihu/pi-portia
+```
+
+Then restart Pi, or run `/reload` in an existing session if your Pi version supports extension reloads.
+
+For local development from a checkout:
+
+```bash
+git clone https://github.com/vihu/pi-portia.git
+cd pi-portia
 npm install
 pi -e .
 ```
 
-Or add the package path to Pi settings:
+To use a local checkout globally without publishing/installing from GitHub, add its absolute path to Pi settings or run:
 
-```jsonc
-{
-  "packages": ["/home/rahul/personal/pi-custom/pi-portia"],
-}
+```bash
+pi install /absolute/path/to/pi-portia
 ```
 
 ## Storage
