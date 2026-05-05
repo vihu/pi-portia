@@ -2,7 +2,7 @@
 
 Pi-native spatial project memory for agents.
 
-Portia is Spider v2: a project-local, inspectable memory layer backed by SQLite. It stores pointers, gotchas, decisions, invariants, purpose, patterns, and plans that help future agents re-perceive code faster. It does not replace reading source files.
+Portia is a project-local, inspectable memory layer backed by SQLite. It stores pointers, gotchas, decisions, invariants, purpose, patterns, and plans that help future agents re-perceive code faster. It does not replace reading source files.
 
 ## Status
 
@@ -38,9 +38,7 @@ Or add the package path to Pi settings:
 
 ```jsonc
 {
-  "packages": [
-    "/home/rahul/personal/pi-custom/pi-portia"
-  ]
+  "packages": ["/home/rahul/personal/pi-custom/pi-portia"],
 }
 ```
 
@@ -109,8 +107,8 @@ Global settings live in Pi's agent settings file. Project settings live in `.pi/
     "enableDependencyScan": true,
     "enableFts": true,
     "enableVectors": false,
-    "autoPromptGuidance": true
-  }
+    "autoPromptGuidance": true,
+  },
 }
 ```
 
