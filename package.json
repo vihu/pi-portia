@@ -1,0 +1,45 @@
+{
+  "name": "pi-portia",
+  "version": "0.1.0",
+  "description": "Pi-native spatial project memory extension backed by SQLite.",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "extension",
+    "memory",
+    "sqlite",
+    "portia"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.mjs'"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.9.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.73.0",
+    "@mariozechner/pi-tui": "^0.73.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.10.2",
+    "typebox": "^1.1.24",
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "README.md",
+    "package.json",
+    "src"
+  ]
+}
