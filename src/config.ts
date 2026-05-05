@@ -18,6 +18,10 @@ interface PartialPortiaSettings {
   enableFts?: boolean;
   enableVectors?: boolean;
   autoPromptGuidance?: boolean;
+  autoRecordGuidance?: boolean;
+  autoSense?: boolean;
+  autoSenseMaxResults?: number;
+  autoSenseMaxChars?: number;
 }
 
 function readJsonSafe(filePath: string): Record<string, unknown> {
@@ -82,6 +86,18 @@ function parseSettingsFile(filePath: string): PartialPortiaSettings {
   const autoPromptGuidance = parseBoolean(input.autoPromptGuidance);
   if (autoPromptGuidance !== undefined) settings.autoPromptGuidance = autoPromptGuidance;
 
+  const autoRecordGuidance = parseBoolean(input.autoRecordGuidance);
+  if (autoRecordGuidance !== undefined) settings.autoRecordGuidance = autoRecordGuidance;
+
+  const autoSense = parseBoolean(input.autoSense);
+  if (autoSense !== undefined) settings.autoSense = autoSense;
+
+  const autoSenseMaxResults = parsePositiveInteger(input.autoSenseMaxResults);
+  if (autoSenseMaxResults) settings.autoSenseMaxResults = Math.min(autoSenseMaxResults, 12);
+
+  const autoSenseMaxChars = parsePositiveInteger(input.autoSenseMaxChars);
+  if (autoSenseMaxChars) settings.autoSenseMaxChars = Math.min(autoSenseMaxChars, 12_000);
+
   return settings;
 }
 
@@ -109,6 +125,10 @@ export function resolvePortiaSettings(cwd: string): PortiaSettings {
     enableFts: true,
     enableVectors: false,
     autoPromptGuidance: true,
+    autoRecordGuidance: true,
+    autoSense: true,
+    autoSenseMaxResults: 5,
+    autoSenseMaxChars: 2_500,
     ...globalSettings,
     ...projectSettings,
   };

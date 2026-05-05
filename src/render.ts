@@ -86,6 +86,28 @@ export function renderSense(result: SenseResult): string {
   return lines.join("\n");
 }
 
+export function renderAutopilotContext(result: SenseResult, maxChars: number): string | undefined {
+  if (result.memories.length === 0) return undefined;
+
+  const lines: string[] = [];
+  lines.push("## Portia Project Context");
+  lines.push("");
+  lines.push("Relevant project-memory pointers for this turn. Verify source before relying on them.");
+  lines.push("");
+
+  for (const memory of result.memories) {
+    const title = memory.title ? `${truncate(memory.title, 120)} — ` : "";
+    const body = truncate(memory.body.replace(/\s+/g, " ").trim(), 240);
+    const line = `- [${memory.id}] ${memory.kind} ${memory.scopePath} — ${title}${body}`;
+    const candidate = [...lines, line].join("\n");
+    if (candidate.length > maxChars) break;
+    lines.push(line);
+  }
+
+  if (lines.length <= 4) return undefined;
+  return truncate(lines.join("\n"), maxChars);
+}
+
 export function renderRecord(result: PortiaRecordResult): string {
   const lines: string[] = [];
   const proposal = result.proposal;
@@ -151,6 +173,9 @@ export function renderStatus(settings: PortiaSettings, stats: PortiaStats): stri
   lines.push(`FTS: ${stats.ftsAvailable ? "available" : "unavailable"}`);
   lines.push(`Dependency scan: ${settings.enableDependencyScan}`);
   lines.push(`Vectors: ${settings.enableVectors ? "enabled" : "disabled"}`);
+  lines.push(`Autopilot guidance: ${settings.autoPromptGuidance}`);
+  lines.push(`Autopilot record guidance: ${settings.autoRecordGuidance}`);
+  lines.push(`Autopilot sense: ${settings.autoSense ? `enabled (${settings.autoSenseMaxResults} memories, ${settings.autoSenseMaxChars} chars)` : "disabled"}`);
   lines.push("");
   lines.push("## Memory Counts");
   lines.push(`- total: ${stats.totalMemories}`);

@@ -16,6 +16,7 @@ Implemented now:
 - `/portia-sense <path> [query]`
 - `portia_sense` read-only tool
 - `portia_record` write/proposal tool
+- turn-local autopilot guidance and bounded context injection
 
 Not implemented yet:
 
@@ -61,7 +62,9 @@ The database is intended to be shared by all agents working in the same checkout
 
 ## Usage
 
-Ask the agent to call `portia_sense` before non-trivial work in unfamiliar project areas, or run:
+Portia includes a small autopilot layer. On each agent turn it can add turn-local guidance and a bounded `Portia Project Context` pack selected from existing memories by prompt/path. This should make Portia useful during normal work without adding persistent boilerplate messages to the session.
+
+You can still run explicit commands:
 
 ```text
 /portia-status
@@ -70,7 +73,7 @@ Ask the agent to call `portia_sense` before non-trivial work in unfamiliar proje
 
 `portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Treat the output as pointers to re-read source files and commands, not as complete ground truth.
 
-Ask the main agent to call `portia_record` after verified durable project findings, for example:
+The main agent can call `portia_record` after verified durable project findings, for example:
 
 ```text
 Record a Portia memory: scope src/auth, kind gotcha, title Auth fixtures, body Login tests require seeded user fixtures; read tests/auth before changing auth behavior.
@@ -98,6 +101,10 @@ Global settings live in Pi's agent settings file. Project settings live in `.pi/
     "enableFts": true,
     "enableVectors": false,
     "autoPromptGuidance": true,
+    "autoRecordGuidance": true,
+    "autoSense": true,
+    "autoSenseMaxResults": 5,
+    "autoSenseMaxChars": 2500,
   },
 }
 ```
@@ -126,6 +133,16 @@ Default public behavior is conservative: `writePolicy` defaults to `confirm`, wh
 ```
 
 That gives the main session automatic Portia writes while fork/subagent child Pi processes remain proposal-only.
+
+Autopilot settings:
+
+- `autoPromptGuidance`: add turn-local Portia guidance to the system prompt
+- `autoRecordGuidance`: include `portia_record` guidance in that prompt section
+- `autoSense`: internally retrieve a bounded context pack for each turn
+- `autoSenseMaxResults`: max memories in that pack, capped at 12
+- `autoSenseMaxChars`: max rendered pack size, capped at 12000
+
+Autopilot does not run a background summarizer or silently write memories by itself. It makes the agent more likely to sense and record intentionally.
 
 ## Development
 

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { buildAutopilotContext, extractPromptPathCandidates, renderAutopilotGuidance, selectAutopilotTarget } from "../src/autopilot.ts";
 import { resolvePortiaSettings } from "../src/config.ts";
 import { openPortiaDatabase } from "../src/db.ts";
 import { recordPortiaMemory } from "../src/record.ts";
@@ -62,6 +63,10 @@ function settings(projectRoot, dbPath, overrides = {}) {
     enableFts: true,
     enableVectors: false,
     autoPromptGuidance: true,
+    autoRecordGuidance: true,
+    autoSense: true,
+    autoSenseMaxResults: 5,
+    autoSenseMaxChars: 2500,
     projectRoot,
     globalSettingsPath: path.join(projectRoot, "global-settings.json"),
     projectSettingsPath: path.join(projectRoot, ".pi", "settings.json"),
@@ -220,6 +225,114 @@ test("recordPortiaMemory returns proposals without writing in readonly and confi
     assert.equal(db.getStats().activeMemories, 0);
   } finally {
     db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("autopilot target selection finds project paths and falls back to root", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src", "db"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db", "client.ts"), "export const db = {};\n");
+
+  try {
+    assert.deepEqual(extractPromptPathCandidates("Please inspect @src/db/client.ts, then ignore A1/A2"), ["src/db/client.ts", "A1/A2"]);
+
+    const target = selectAutopilotTarget(settings(project, dbPath), "Please inspect @src/db/client.ts, then ignore A1/A2", project);
+    assert.equal(target.path, "src/db/client.ts");
+    assert.equal(target.includeDependencies, true);
+    assert.equal(target.matchedPromptPath, "src/db/client.ts");
+
+    const fallback = selectAutopilotTarget(settings(project, dbPath), "What should I know next?", project);
+    assert.equal(fallback.path, ".");
+    assert.equal(fallback.includeDependencies, false);
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("autopilot guidance reflects write policy and can omit record guidance", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+
+  try {
+    const writeGuidance = renderAutopilotGuidance(settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }));
+    assert.match(writeGuidance, /Portia project memory autopilot/);
+    assert.match(writeGuidance, /record durable memories without asking/);
+
+    const noRecordGuidance = renderAutopilotGuidance(settings(project, dbPath, {
+      autoRecordGuidance: false,
+    }));
+    assert.doesNotMatch(noRecordGuidance, /portia_record/);
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("autopilot context renders a bounded Portia Project Context pack", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db.ts"), "export const schema = 'memory_fts';\n");
+
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+  insertMemory(dbPath, {
+    id: "fts-trigger-gotcha",
+    scope_path: "src/db.ts",
+    kind: "gotcha",
+    title: "FTS trigger maintenance",
+    body: "memory_fts is maintained by SQLite triggers; inspect src/db.ts before changing schema writes.",
+    importance: 8,
+  });
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    const context = buildAutopilotContext(reopened, settings(project, dbPath, {
+      autoSenseMaxResults: 2,
+      autoSenseMaxChars: 500,
+    }), "Before editing src/db.ts, what about memory_fts triggers?", project);
+
+    assert.match(context, /## Portia Project Context/);
+    assert.match(context, /fts-trigger-gotcha/);
+    assert.match(context, /Verify source before relying/);
+    assert.equal(context.length <= 500, true);
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("resolvePortiaSettings parses autopilot settings and caps auto sense limits", () => {
+  const project = tempProject();
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-portia-agent-"));
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+  try {
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({
+      portia: {
+        autoPromptGuidance: false,
+        autoRecordGuidance: false,
+        autoSense: false,
+        autoSenseMaxResults: 99,
+        autoSenseMaxChars: 99_999,
+      },
+    }));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+
+    const resolved = resolvePortiaSettings(project);
+    assert.equal(resolved.autoPromptGuidance, false);
+    assert.equal(resolved.autoRecordGuidance, false);
+    assert.equal(resolved.autoSense, false);
+    assert.equal(resolved.autoSenseMaxResults, 12);
+    assert.equal(resolved.autoSenseMaxChars, 12_000);
+  } finally {
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+    fs.rmSync(agentDir, { recursive: true, force: true });
     fs.rmSync(project, { recursive: true, force: true });
   }
 });

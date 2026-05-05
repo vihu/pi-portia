@@ -25,6 +25,10 @@ export interface PortiaSettings {
   enableFts: boolean;
   enableVectors: boolean;
   autoPromptGuidance: boolean;
+  autoRecordGuidance: boolean;
+  autoSense: boolean;
+  autoSenseMaxResults: number;
+  autoSenseMaxChars: number;
   modeOverride?: PortiaMode;
   projectRoot: string;
   globalSettingsPath: string;
