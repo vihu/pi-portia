@@ -4,6 +4,7 @@ import { resolvePortiaSettings } from "./config.ts";
 import { openPortiaDatabase } from "./db.ts";
 import { renderSense, renderStatus } from "./render.ts";
 import { senseMemories } from "./retrieval.ts";
+import { registerPortiaRecordTool } from "./tools/record.ts";
 import { registerPortiaSenseTool } from "./tools/sense.ts";
 
 function parseSenseArgs(args: string): { path: string; query?: string } {
@@ -24,6 +25,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerPortiaSenseTool(pi);
+  registerPortiaRecordTool(pi);
 
   pi.registerCommand("portia-status", {
     description: "Show Portia project memory status and database counts.",

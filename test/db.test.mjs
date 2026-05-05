@@ -4,7 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { resolvePortiaSettings } from "../src/config.ts";
 import { openPortiaDatabase } from "../src/db.ts";
+import { recordPortiaMemory } from "../src/record.ts";
 import { senseMemories } from "../src/retrieval.ts";
 
 function tempProject() {
@@ -47,13 +49,14 @@ function insertMemory(dbPath, overrides = {}) {
   return row;
 }
 
-function settings(projectRoot, dbPath) {
+function settings(projectRoot, dbPath, overrides = {}) {
+  const writePolicy = overrides.writePolicy ?? "confirm";
   return {
     enabled: true,
     dbPath,
-    writePolicy: "confirm",
+    writePolicy,
     workerWritePolicy: "readonly",
-    effectiveWritePolicy: "confirm",
+    effectiveWritePolicy: overrides.effectiveWritePolicy ?? writePolicy,
     maxSenseResults: 12,
     enableDependencyScan: true,
     enableFts: true,
@@ -62,6 +65,7 @@ function settings(projectRoot, dbPath) {
     projectRoot,
     globalSettingsPath: path.join(projectRoot, "global-settings.json"),
     projectSettingsPath: path.join(projectRoot, ".pi", "settings.json"),
+    ...overrides,
   };
 }
 
@@ -137,6 +141,114 @@ test("senseMemories ranks proximity, dependency, and FTS memories", () => {
     assert.equal(result.signals.some((signal) => signal.type === "chord"), true);
   } finally {
     reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("recordPortiaMemory writes memory, event, and searchable FTS when policy is write", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const result = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      scopePath: "src/auth",
+      kind: "decision",
+      title: "Token compaction decision",
+      body: "Use Portia records to preserve durable project decisions after compaction resumes a session.",
+      importance: 7,
+      confidence: 95,
+      sourceType: "observation",
+      sourceRef: "abc123def456",
+      evidence: "Synthetic observation id used by this test to verify provenance payloads.",
+    }, project);
+
+    assert.equal(result.written, true);
+    assert.equal(result.memory?.scopePath, "src/auth");
+    assert.equal(result.memory?.kind, "decision");
+    assert.equal(result.memory?.sourceType, "observation");
+    assert.equal(result.memory?.sourceRef, "abc123def456");
+    assert.equal(result.event?.eventType, "created");
+    assert.equal(db.getStats().activeMemories, 1);
+    assert.equal(db.searchActiveMemories('"compaction"', 10).at(0)?.id, result.memory?.id);
+
+    const events = db.getMemoryEvents(result.memory.id);
+    assert.equal(events.length, 1);
+    const payload = JSON.parse(events[0].payloadJson);
+    assert.equal(payload.action, "record");
+    assert.equal(payload.proposal.sourceType, "observation");
+    assert.equal(payload.evidence, "Synthetic observation id used by this test to verify provenance payloads.");
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("recordPortiaMemory returns proposals without writing in readonly and confirm policies", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  const input = {
+    scopePath: ".",
+    kind: "gotcha",
+    title: "Readonly proposal",
+    body: "Readonly and confirm policies should return structured proposals without durable memory writes.",
+    sourceType: "command",
+    sourceRef: "node --test",
+  };
+
+  try {
+    const readonly = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "readonly",
+      modeOverride: "readonly",
+    }), input, project);
+    assert.equal(readonly.written, false);
+    assert.equal(readonly.skipReason, "readonly");
+    assert.equal(readonly.proposal.scopePath, ".");
+    assert.equal(db.getStats().activeMemories, 0);
+
+    const confirm = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "confirm",
+      effectiveWritePolicy: "confirm",
+    }), input, project);
+    assert.equal(confirm.written, false);
+    assert.equal(confirm.skipReason, "confirm");
+    assert.equal(db.getStats().activeMemories, 0);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("PORTIA_MODE=readonly overrides configured write policy", () => {
+  const project = tempProject();
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-portia-agent-"));
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const oldPortiaMode = process.env.PORTIA_MODE;
+
+  try {
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({
+      portia: {
+        writePolicy: "write",
+      },
+    }));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.PORTIA_MODE = "readonly";
+
+    const resolved = resolvePortiaSettings(project);
+    assert.equal(resolved.writePolicy, "write");
+    assert.equal(resolved.effectiveWritePolicy, "readonly");
+    assert.equal(resolved.modeOverride, "readonly");
+  } finally {
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+    if (oldPortiaMode === undefined) delete process.env.PORTIA_MODE;
+    else process.env.PORTIA_MODE = oldPortiaMode;
+    fs.rmSync(agentDir, { recursive: true, force: true });
     fs.rmSync(project, { recursive: true, force: true });
   }
 });

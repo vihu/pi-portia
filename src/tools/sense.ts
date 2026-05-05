@@ -29,6 +29,7 @@ export function registerPortiaSenseTool(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use portia_sense before non-trivial work in unfamiliar project areas.",
       "Treat portia_sense results as pointers; follow referenced files and commands before relying on them.",
+      "After verified durable findings, use portia_record for project-specific decisions, gotchas, invariants, or pointers.",
     ],
     parameters: PortiaSenseParams,
 

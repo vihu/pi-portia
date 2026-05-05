@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import type { PortiaSettings, PortiaStats, RetrievedMemory, RetrievalSignal, SenseResult } from "./types.ts";
+import type { PortiaRecordResult, PortiaSettings, PortiaStats, RetrievedMemory, RetrievalSignal, SenseResult } from "./types.ts";
 
 function truncate(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
@@ -83,6 +83,57 @@ export function renderSense(result: SenseResult): string {
 
   lines.push("");
   lines.push("Reminder: Portia memories are pointers and gotchas, not source-of-truth replacements. Follow referenced files and commands.");
+  return lines.join("\n");
+}
+
+export function renderRecord(result: PortiaRecordResult): string {
+  const lines: string[] = [];
+  const proposal = result.proposal;
+
+  lines.push("# Portia Record");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Write policy: ${result.writePolicy}`);
+  if (result.modeOverride) lines.push(`PORTIA_MODE: ${result.modeOverride}`);
+  lines.push(`Status: ${result.written ? "written" : "proposal-only"}`);
+  if (result.skipReason === "readonly") lines.push("Reason: readonly policy; no durable Portia write was made.");
+  if (result.skipReason === "confirm") lines.push("Reason: confirm policy currently returns a proposal; no durable Portia write was made.");
+  if (result.memory) lines.push(`Memory: ${result.memory.id}`);
+  if (result.event) lines.push(`Event: ${result.event.id}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  lines.push("");
+  lines.push("## Memory");
+  lines.push(`- scope: ${proposal.scopePath}`);
+  lines.push(`- kind: ${proposal.kind}`);
+  lines.push(`- importance: ${proposal.importance}`);
+  lines.push(`- confidence: ${proposal.confidence}`);
+  if (proposal.sourceType || proposal.sourceRef) {
+    lines.push(`- source: ${[proposal.sourceType, proposal.sourceRef].filter(Boolean).join(":")}`);
+  }
+  if (proposal.title) {
+    lines.push("");
+    lines.push(truncate(proposal.title, 160));
+  }
+  lines.push("");
+  lines.push(truncate(proposal.body, 900));
+  if (proposal.evidence) {
+    lines.push("");
+    lines.push("## Evidence");
+    lines.push(truncate(proposal.evidence, 900));
+  }
+
+  if (!result.written) {
+    lines.push("");
+    lines.push("This is a structured proposal only. A main session with writePolicy=write can persist it with portia_record.");
+  }
+
   return lines.join("\n");
 }
 

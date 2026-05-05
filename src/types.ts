@@ -12,6 +12,7 @@ export type MemoryKind = typeof MEMORY_KINDS[number];
 export type MemoryStatus = "active" | "superseded" | "stale" | "deleted";
 export type WritePolicy = "readonly" | "confirm" | "write";
 export type PortiaMode = WritePolicy | "off";
+export type PortiaRecordSkipReason = "readonly" | "confirm";
 
 export interface PortiaSettings {
   enabled: boolean;
@@ -46,6 +47,71 @@ export interface MemoryRecord {
   supersedesId?: string;
   sourceType?: string;
   sourceRef?: string;
+}
+
+export interface MemoryEvent {
+  id: string;
+  memoryId: string;
+  eventType: string;
+  payloadJson: string;
+  createdAt: string;
+  createdBy?: string;
+}
+
+export interface CreateMemoryInput {
+  scopePath: string;
+  kind: MemoryKind;
+  title?: string;
+  body: string;
+  importance: number;
+  confidence: number;
+  createdBy?: string;
+  supersedesId?: string;
+  sourceType?: string;
+  sourceRef?: string;
+  eventPayload?: Record<string, unknown>;
+}
+
+export interface CreateMemoryResult {
+  memory: MemoryRecord;
+  event: MemoryEvent;
+}
+
+export interface PortiaRecordInput {
+  scopePath: string;
+  kind: MemoryKind;
+  body: string;
+  title?: string;
+  importance?: number;
+  confidence?: number;
+  sourceType?: string;
+  sourceRef?: string;
+  evidence?: string;
+}
+
+export interface PortiaRecordProposal {
+  scopePath: string;
+  kind: MemoryKind;
+  title?: string;
+  body: string;
+  importance: number;
+  confidence: number;
+  sourceType?: string;
+  sourceRef?: string;
+  evidence?: string;
+}
+
+export interface PortiaRecordResult {
+  projectRoot: string;
+  dbPath: string;
+  writePolicy: WritePolicy;
+  modeOverride?: PortiaMode;
+  written: boolean;
+  skipReason?: PortiaRecordSkipReason;
+  proposal: PortiaRecordProposal;
+  memory?: MemoryRecord;
+  event?: MemoryEvent;
+  warnings: string[];
 }
 
 export interface PortiaStats {

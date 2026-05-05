@@ -15,10 +15,10 @@ Implemented now:
 - `/portia-status`
 - `/portia-sense <path> [query]`
 - `portia_sense` read-only tool
+- `portia_record` write/proposal tool
 
 Not implemented yet:
 
-- `portia_record`
 - `portia_repair`
 - export/import
 - reflection/proposal workflow
@@ -70,34 +70,17 @@ Ask the agent to call `portia_sense` before non-trivial work in unfamiliar proje
 
 `portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Treat the output as pointers to re-read source files and commands, not as complete ground truth.
 
-## Manual seeding for the MVP
+Ask the main agent to call `portia_record` after verified durable project findings, for example:
 
-Until `portia_record` exists, seed memories directly with SQLite if needed:
-
-```bash
-sqlite3 .pi/portia/portia.sqlite <<'SQL'
-insert into memories (
-  id, scope_path, kind, title, body, status, importance, confidence,
-  created_at, updated_at, created_by, source_type, source_ref
-) values (
-  lower(hex(randomblob(8))),
-  'src/auth',
-  'gotcha',
-  'Auth fixtures',
-  'Login tests require seeded user fixtures; read tests/auth before changing auth behavior.',
-  'active',
-  5,
-  90,
-  datetime('now'),
-  datetime('now'),
-  'manual',
-  'manual',
-  'sqlite'
-);
-SQL
+```text
+Record a Portia memory: scope src/auth, kind gotcha, title Auth fixtures, body Login tests require seeded user fixtures; read tests/auth before changing auth behavior.
 ```
 
-The FTS index is maintained by triggers.
+`portia_record` writes immediately only when the effective write policy is `write`. In `readonly` and current `confirm` mode, it returns a structured proposal and does not persist a memory.
+
+Use `sourceType` and `sourceRef` for provenance. When promoting an observational-memory fact, set `sourceType` to `observation` or `reflection` and put the observation/reflection id in `sourceRef`.
+
+The FTS index is maintained by SQLite triggers.
 
 ## Settings
 
@@ -122,11 +105,27 @@ Global settings live in Pi's agent settings file. Project settings live in `.pi/
 Environment override:
 
 ```bash
-PORTIA_MODE=readonly # force read-only behavior
+PORTIA_MODE=readonly # force read-only/proposal-only behavior
 PORTIA_MODE=off      # disable Portia tools/commands
 ```
 
-The current MVP is read-only at the memory level regardless of `writePolicy`; the policy is reported by `/portia-status` for the upcoming write tools.
+Default public behavior is conservative: `writePolicy` defaults to `confirm`, which currently returns a proposal. If you want the main agent to record durable memories without asking every time, set:
+
+```jsonc
+{
+  "portia": {
+    "writePolicy": "write"
+  },
+  "pi-fork": {
+    "environment": { "PORTIA_MODE": "readonly" }
+  },
+  "pi-minimal-subagent": {
+    "environment": { "PORTIA_MODE": "readonly" }
+  }
+}
+```
+
+That gives the main session automatic Portia writes while fork/subagent child Pi processes remain proposal-only.
 
 ## Development
 

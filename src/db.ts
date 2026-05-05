@@ -1,9 +1,10 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
 
 type DatabaseConnection = InstanceType<typeof Database>;
-import type { MemoryRecord, PortiaStats } from "./types.ts";
+import type { CreateMemoryInput, CreateMemoryResult, MemoryEvent, MemoryRecord, PortiaStats } from "./types.ts";
 
 const SCHEMA_VERSION = 1;
 
@@ -23,6 +24,15 @@ interface MemoryRow {
   supersedes_id: string | null;
   source_type: string | null;
   source_ref: string | null;
+}
+
+interface EventRow {
+  id: string;
+  memory_id: string;
+  event_type: string;
+  payload_json: string;
+  created_at: string;
+  created_by: string | null;
 }
 
 interface CountRow {
@@ -60,6 +70,17 @@ function toMemory(row: MemoryRow): MemoryRecord {
     supersedesId: row.supersedes_id ?? undefined,
     sourceType: row.source_type ?? undefined,
     sourceRef: row.source_ref ?? undefined,
+  };
+}
+
+function toEvent(row: EventRow): MemoryEvent {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    eventType: row.event_type,
+    payloadJson: row.payload_json,
+    createdAt: row.created_at,
+    createdBy: row.created_by ?? undefined,
   };
 }
 
@@ -158,6 +179,92 @@ export class PortiaDatabase {
 
   close(): void {
     this.db.close();
+  }
+
+  private getMemoryById(id: string): MemoryRecord {
+    const row = this.db.prepare(`
+      select rowid, id, scope_path, kind, title, body, status, importance, confidence,
+             created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+      from memories
+      where id = ?
+    `).get(id) as MemoryRow | undefined;
+
+    if (!row) throw new Error(`Portia memory was not found after write: ${id}`);
+    return toMemory(row);
+  }
+
+  private getEventById(id: string): MemoryEvent {
+    const row = this.db.prepare(`
+      select id, memory_id, event_type, payload_json, created_at, created_by
+      from memory_events
+      where id = ?
+    `).get(id) as EventRow | undefined;
+
+    if (!row) throw new Error(`Portia memory event was not found after write: ${id}`);
+    return toEvent(row);
+  }
+
+  createMemory(input: CreateMemoryInput): CreateMemoryResult {
+    const id = randomUUID();
+    const eventId = randomUUID();
+    const now = new Date().toISOString();
+    const createdBy = input.createdBy ?? "portia";
+    const payloadJson = JSON.stringify(input.eventPayload ?? { action: "record" });
+
+    const insert = this.db.transaction(() => {
+      this.db.prepare(`
+        insert into memories (
+          id, scope_path, kind, title, body, status, importance, confidence,
+          created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+        ) values (
+          @id, @scopePath, @kind, @title, @body, 'active', @importance, @confidence,
+          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef
+        )
+      `).run({
+        id,
+        scopePath: input.scopePath,
+        kind: input.kind,
+        title: input.title ?? null,
+        body: input.body,
+        importance: input.importance,
+        confidence: input.confidence,
+        createdAt: now,
+        updatedAt: now,
+        createdBy,
+        supersedesId: input.supersedesId ?? null,
+        sourceType: input.sourceType ?? null,
+        sourceRef: input.sourceRef ?? null,
+      });
+
+      this.db.prepare(`
+        insert into memory_events (id, memory_id, event_type, payload_json, created_at, created_by)
+        values (@id, @memoryId, 'created', @payloadJson, @createdAt, @createdBy)
+      `).run({
+        id: eventId,
+        memoryId: id,
+        payloadJson,
+        createdAt: now,
+        createdBy,
+      });
+
+      return {
+        memory: this.getMemoryById(id),
+        event: this.getEventById(eventId),
+      };
+    });
+
+    return insert();
+  }
+
+  getMemoryEvents(memoryId: string): MemoryEvent[] {
+    const rows = this.db.prepare(`
+      select id, memory_id, event_type, payload_json, created_at, created_by
+      from memory_events
+      where memory_id = ?
+      order by created_at asc, id asc
+    `).all(memoryId) as EventRow[];
+
+    return rows.map(toEvent);
   }
 
   getStats(): PortiaStats {
