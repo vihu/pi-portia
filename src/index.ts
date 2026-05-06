@@ -104,6 +104,13 @@ function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction
   return { id, action: action as PortiaRepairAction, reason };
 }
 
+function parseDeleteArgs(args: string): { id: string; action: "delete"; reason: string; sourceType: string; sourceRef: string } {
+  const [id, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+  const reason = rest.join(" ").trim();
+  if (!id || !reason) throw new Error("Usage: /portia-delete <memory-id> <reason>");
+  return { id, action: "delete", reason, sourceType: "command", sourceRef: "/portia-delete" };
+}
+
 function appendPromptSection(systemPrompt: string, section: string): string {
   return `${systemPrompt}\n\n${section}`;
 }
@@ -281,6 +288,43 @@ export default function (pi: ExtensionAPI) {
       let input: { id: string; action: PortiaRepairAction; reason: string };
       try {
         input = parseRepairArgs(args);
+      } catch (error) {
+        sendPortiaCommandError(pi, error);
+        return;
+      }
+
+      const db = openPortiaDatabase(settings.dbPath);
+      try {
+        const result = repairPortiaMemory(db, settings, input);
+        pi.sendMessage({
+          customType: "portia",
+          content: renderRepair(result),
+          display: true,
+          details: result,
+        });
+      } finally {
+        db.close();
+      }
+    },
+  });
+
+  pi.registerCommand("portia-delete", {
+    description: "Soft-delete a Portia memory: /portia-delete <memory-id> <reason>",
+    handler: async (args, ctx) => {
+      const settings = resolvePortiaSettings(ctx.cwd);
+      if (!settings.enabled) {
+        pi.sendMessage({
+          customType: "portia",
+          content: "Portia is disabled for this project/session.",
+          display: true,
+          details: { enabled: false, projectRoot: settings.projectRoot, modeOverride: settings.modeOverride },
+        });
+        return;
+      }
+
+      let input: { id: string; action: "delete"; reason: string; sourceType: string; sourceRef: string };
+      try {
+        input = parseDeleteArgs(args);
       } catch (error) {
         sendPortiaCommandError(pi, error);
         return;

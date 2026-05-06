@@ -17,6 +17,7 @@ export function inspectPortiaMemory(db: PortiaDatabase, settings: PortiaSettings
   const memory = db.getMemory(id);
   const includeEvents = input.includeEvents ?? true;
   const events = memory && includeEvents ? db.getMemoryEvents(id) : [];
+  const supersededBy = memory ? db.getMemoriesSuperseding(id) : [];
   const warnings: string[] = [];
 
   if (!memory) warnings.push("No Portia memory found for this id. Try /portia-list query <term> to search.");
@@ -27,6 +28,7 @@ export function inspectPortiaMemory(db: PortiaDatabase, settings: PortiaSettings
     id,
     memory,
     events,
+    supersededBy,
     warnings,
   };
 }

@@ -17,6 +17,7 @@ Implemented now:
 - `/portia-list`
 - `/portia-inspect <id>`
 - `/portia-repair <id> <stale|delete|reactivate> <reason>`
+- `/portia-delete <id> <reason>` soft-delete convenience command
 - `portia_sense` read-only tool
 - `portia_record` write/proposal tool
 - `portia_list` read-only tool
@@ -81,11 +82,12 @@ You can still run explicit commands:
 /portia-list query autopilot
 /portia-inspect <memory-id>
 /portia-repair <memory-id> delete Temporary test memory; safe to hide from active retrieval.
+/portia-delete <memory-id> Temporary test memory; safe to hide from active retrieval.
 ```
 
 `portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Treat the output as pointers to re-read source files and commands, not as complete ground truth.
 
-Use `portia_list`/`/portia-list` to browse memories, `portia_inspect`/`/portia-inspect` to view one memory with provenance and event history, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records.
+Use `portia_list`/`/portia-list` to browse memories, `portia_inspect`/`/portia-inspect` to view one memory with provenance and event history, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records. `/portia-delete <id> <reason>` is a shorter human-facing alias for soft deletion.
 
 The main agent can call `portia_record` after verified durable project findings, for example:
 
@@ -93,7 +95,7 @@ The main agent can call `portia_record` after verified durable project findings,
 Record a Portia memory: scope src/auth, kind gotcha, title Auth fixtures, body Login tests require seeded user fixtures; read tests/auth before changing auth behavior.
 ```
 
-`portia_record` writes immediately only when the effective write policy is `write`. In `readonly` and current `confirm` mode, it returns a structured proposal and does not persist a memory.
+`portia_record` writes immediately only when the effective write policy is `write`. In `readonly` and current `confirm` mode, it returns a structured proposal and does not persist a memory. It blocks exact duplicate active memories by default (`duplicatePolicy: "blockExact"`), can return related-memory warnings, and accepts `supersedesId` to create a replacement memory while atomically marking the old active memory `superseded`.
 
 Use `sourceType` and `sourceRef` for provenance. When promoting an observational-memory fact, set `sourceType` to `observation` or `reflection` and put the observation/reflection id in `sourceRef`.
 
@@ -164,4 +166,10 @@ Autopilot does not run a background summarizer or silently write memories by its
 npm run typecheck
 npm test
 pi -e .
+```
+
+If `pi-portia` is also installed globally, avoid duplicate tool registration during local smoke tests by loading only the explicit checkout:
+
+```bash
+PI_OFFLINE=1 pi --no-extensions -e . --no-session -p "/portia-status"
 ```

@@ -7,6 +7,8 @@ type DatabaseConnection = InstanceType<typeof Database>;
 import type {
   CreateMemoryInput,
   CreateMemoryResult,
+  CreateMemorySupersedingInput,
+  CreateMemorySupersedingResult,
   MemoryEvent,
   MemoryListFilters,
   MemoryRecord,
@@ -120,6 +122,46 @@ function memoryStatusOrderSql(): string {
       else 9
     end
   `;
+}
+
+function normalizeDuplicateText(value: string | undefined): string {
+  return (value ?? "").trim().replace(/\s+/g, " ");
+}
+
+const RELATED_STOP_WORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "that",
+  "this",
+  "with",
+  "from",
+  "into",
+  "when",
+  "then",
+  "than",
+  "should",
+  "memory",
+  "memories",
+  "portia",
+]);
+
+function relatedTokens(value: string): Set<string> {
+  const tokens = value.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? [];
+  return new Set(tokens.filter((token) => !RELATED_STOP_WORDS.has(token)));
+}
+
+function relatedScore(queryTokens: Set<string>, memory: MemoryRecord): number {
+  if (queryTokens.size === 0) return 0;
+  const memoryTokens = relatedTokens(`${memory.title ?? ""} ${memory.body}`);
+  if (memoryTokens.size === 0) return 0;
+
+  let overlap = 0;
+  for (const token of queryTokens) {
+    if (memoryTokens.has(token)) overlap += 1;
+  }
+
+  return overlap / Math.sqrt(queryTokens.size * memoryTokens.size);
 }
 
 function runMigrations(db: DatabaseConnection): void {
@@ -297,6 +339,150 @@ export class PortiaDatabase {
     return insert();
   }
 
+  createMemorySuperseding(input: CreateMemorySupersedingInput): CreateMemorySupersedingResult {
+    const existing = this.requireMemory(input.supersedesId);
+    if (existing.status !== "active") {
+      throw new Error(`Portia supersedes target must be active; ${input.supersedesId} is ${existing.status}.`);
+    }
+
+    const id = randomUUID();
+    const eventId = randomUUID();
+    const supersedeEventId = randomUUID();
+    const now = new Date().toISOString();
+    const createdBy = input.createdBy ?? "portia";
+    const payloadJson = JSON.stringify(input.eventPayload ?? { action: "record" });
+    const eventPayload = input.eventPayload ?? {};
+    const evidence = typeof eventPayload.evidence === "string" ? eventPayload.evidence : undefined;
+    const supersedePayloadJson = JSON.stringify({
+      action: "supersede",
+      reason: input.supersedeReason,
+      oldStatus: existing.status,
+      newStatus: "superseded",
+      replacementId: id,
+      sourceType: input.sourceType,
+      sourceRef: input.sourceRef,
+      evidence,
+    });
+
+    const insert = this.db.transaction(() => {
+      this.db.prepare(`
+        insert into memories (
+          id, scope_path, kind, title, body, status, importance, confidence,
+          created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+        ) values (
+          @id, @scopePath, @kind, @title, @body, 'active', @importance, @confidence,
+          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef
+        )
+      `).run({
+        id,
+        scopePath: input.scopePath,
+        kind: input.kind,
+        title: input.title ?? null,
+        body: input.body,
+        importance: input.importance,
+        confidence: input.confidence,
+        createdAt: now,
+        updatedAt: now,
+        createdBy,
+        supersedesId: input.supersedesId,
+        sourceType: input.sourceType ?? null,
+        sourceRef: input.sourceRef ?? null,
+      });
+
+      this.db.prepare(`
+        insert into memory_events (id, memory_id, event_type, payload_json, created_at, created_by)
+        values (@id, @memoryId, 'created', @payloadJson, @createdAt, @createdBy)
+      `).run({
+        id: eventId,
+        memoryId: id,
+        payloadJson,
+        createdAt: now,
+        createdBy,
+      });
+
+      this.db.prepare(`
+        update memories
+        set status = 'superseded',
+            updated_at = @updatedAt
+        where id = @id
+      `).run({
+        id: input.supersedesId,
+        updatedAt: now,
+      });
+
+      this.db.prepare(`
+        insert into memory_events (id, memory_id, event_type, payload_json, created_at, created_by)
+        values (@id, @memoryId, 'status_changed', @payloadJson, @createdAt, @createdBy)
+      `).run({
+        id: supersedeEventId,
+        memoryId: input.supersedesId,
+        payloadJson: supersedePayloadJson,
+        createdAt: now,
+        createdBy,
+      });
+
+      return {
+        memory: this.requireMemory(id),
+        event: this.getEventById(eventId),
+        supersededMemory: this.requireMemory(input.supersedesId),
+        supersedeEvent: this.getEventById(supersedeEventId),
+      };
+    });
+
+    return insert();
+  }
+
+  findExactDuplicateMemory(input: { scopePath: string; kind: string; title?: string; body: string }): MemoryRecord | undefined {
+    const title = normalizeDuplicateText(input.title);
+    const body = normalizeDuplicateText(input.body);
+    const rows = this.db.prepare(`
+      ${memorySelectSql()}
+      where status = 'active' and scope_path = @scopePath and kind = @kind
+      order by importance desc, updated_at desc, id asc
+    `).all({
+      scopePath: input.scopePath,
+      kind: input.kind,
+    }) as MemoryRow[];
+
+    for (const row of rows) {
+      const memory = toMemory(row);
+      if (normalizeDuplicateText(memory.title) === title && normalizeDuplicateText(memory.body) === body) return memory;
+    }
+
+    return undefined;
+  }
+
+  findRelatedMemories(input: { scopePath: string; kind?: string; query?: string; title?: string; body?: string; limit?: number; status?: "active" | "any" }): MemoryRecord[] {
+    const limit = clampLimit(input.limit, 5);
+    const status = input.status ?? "active";
+    const clauses = ["scope_path = @scopePath"];
+    const params: Record<string, unknown> = { scopePath: input.scopePath, limit: Math.max(limit * 8, 20) };
+
+    if (status !== "any") clauses.push("status = 'active'");
+    if (input.kind) {
+      clauses.push("kind = @kind");
+      params.kind = input.kind;
+    }
+
+    const rows = this.db.prepare(`
+      ${memorySelectSql()}
+      where ${clauses.join(" and ")}
+      order by importance desc, updated_at desc, id asc
+      limit @limit
+    `).all(params) as MemoryRow[];
+
+    const queryTokens = relatedTokens(input.query ?? `${input.title ?? ""} ${input.body ?? ""}`);
+    return rows
+      .map((row) => {
+        const memory = toMemory(row);
+        return { memory, score: relatedScore(queryTokens, memory) };
+      })
+      .filter((candidate) => candidate.score > 0)
+      .sort((a, b) => b.score - a.score || b.memory.importance - a.memory.importance || b.memory.updatedAt.localeCompare(a.memory.updatedAt) || a.memory.id.localeCompare(b.memory.id))
+      .slice(0, limit)
+      .map((candidate) => candidate.memory);
+  }
+
   listMemories(filters: MemoryListFilters = {}): MemoryRecord[] {
     const clauses: string[] = [];
     const params: Record<string, unknown> = {
@@ -399,6 +585,16 @@ export class PortiaDatabase {
     `).all(memoryId) as EventRow[];
 
     return rows.map(toEvent);
+  }
+
+  getMemoriesSuperseding(memoryId: string): MemoryRecord[] {
+    const rows = this.db.prepare(`
+      ${memorySelectSql()}
+      where supersedes_id = ?
+      order by ${memoryStatusOrderSql()} asc, importance desc, updated_at desc, id asc
+    `).all(memoryId) as MemoryRow[];
+
+    return rows.map(toMemory);
   }
 
   getStats(): PortiaStats {

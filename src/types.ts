@@ -20,7 +20,8 @@ export type MemoryStatus = typeof MEMORY_STATUSES[number];
 export type MemoryListStatus = MemoryStatus | "any";
 export type WritePolicy = "readonly" | "confirm" | "write";
 export type PortiaMode = WritePolicy | "off";
-export type PortiaRecordSkipReason = "readonly" | "confirm";
+export type PortiaRecordSkipReason = "readonly" | "confirm" | "duplicate";
+export type PortiaDuplicatePolicy = "warn" | "blockExact";
 export type PortiaRepairAction = "stale" | "delete" | "reactivate";
 export type PortiaRepairSkipReason = "readonly" | "confirm" | "noop";
 
@@ -91,6 +92,16 @@ export interface CreateMemoryResult {
   event: MemoryEvent;
 }
 
+export interface CreateMemorySupersedingInput extends CreateMemoryInput {
+  supersedesId: string;
+  supersedeReason: string;
+}
+
+export interface CreateMemorySupersedingResult extends CreateMemoryResult {
+  supersededMemory: MemoryRecord;
+  supersedeEvent: MemoryEvent;
+}
+
 export interface PortiaRecordInput {
   scopePath: string;
   kind: MemoryKind;
@@ -101,6 +112,8 @@ export interface PortiaRecordInput {
   sourceType?: string;
   sourceRef?: string;
   evidence?: string;
+  supersedesId?: string;
+  duplicatePolicy?: PortiaDuplicatePolicy;
 }
 
 export interface PortiaRecordProposal {
@@ -113,6 +126,8 @@ export interface PortiaRecordProposal {
   sourceType?: string;
   sourceRef?: string;
   evidence?: string;
+  supersedesId?: string;
+  duplicatePolicy: PortiaDuplicatePolicy;
 }
 
 export interface PortiaRecordResult {
@@ -126,6 +141,10 @@ export interface PortiaRecordResult {
   memory?: MemoryRecord;
   event?: MemoryEvent;
   warnings: string[];
+  duplicateBlockedBy?: MemoryRecord;
+  relatedMemories: MemoryRecord[];
+  supersededMemory?: MemoryRecord;
+  supersedeEvent?: MemoryEvent;
 }
 
 export interface MemoryListFilters {
@@ -161,6 +180,7 @@ export interface PortiaInspectResult {
   id: string;
   memory?: MemoryRecord;
   events: MemoryEvent[];
+  supersededBy: MemoryRecord[];
   warnings: string[];
 }
 

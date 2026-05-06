@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { resolvePortiaSettings } from "../config.ts";
 import { openPortiaDatabase } from "../db.ts";
-import { proposePortiaRecord, recordPortiaMemory } from "../record.ts";
+import { recordPortiaMemory } from "../record.ts";
 import { renderRecord } from "../render.ts";
 import type { PortiaRecordInput } from "../types.ts";
 
@@ -42,6 +42,15 @@ export const PortiaRecordParams = Type.Object({
   evidence: Type.Optional(Type.String({
     description: "Short supporting evidence stored in the memory event payload.",
   })),
+  supersedesId: Type.Optional(Type.String({
+    description: "Optional active memory id this new memory replaces; the old memory is marked superseded when writing is allowed.",
+  })),
+  duplicatePolicy: Type.Optional(Type.Union([
+    Type.Literal("warn"),
+    Type.Literal("blockExact"),
+  ], {
+    description: "Exact duplicate handling. Defaults to blockExact; warn allows the write with warnings.",
+  })),
 });
 
 export function registerPortiaRecordTool(pi: ExtensionAPI): void {
@@ -54,6 +63,7 @@ export function registerPortiaRecordTool(pi: ExtensionAPI): void {
       "Use portia_record only for durable, verified, project-specific facts that will help future agents re-perceive the codebase.",
       "Good records include decisions, gotchas, invariants, source/navigation pointers, package commands, and spatial relationships.",
       "Do not record generic advice, raw conversation summaries, every file read, or unverified speculation.",
+      "Use supersedesId when a new memory intentionally replaces an older active Portia memory.",
       "When promoting observational-memory facts, preserve the observation/reflection id in sourceRef and set sourceType accordingly.",
     ],
     parameters: PortiaRecordParams,
@@ -68,14 +78,6 @@ export function registerPortiaRecordTool(pi: ExtensionAPI): void {
       }
 
       const input = params as PortiaRecordInput;
-
-      if (settings.effectiveWritePolicy !== "write") {
-        const result = proposePortiaRecord(settings, input, ctx.cwd);
-        return {
-          content: [{ type: "text" as const, text: renderRecord(result) }],
-          details: result,
-        };
-      }
 
       const db = openPortiaDatabase(settings.dbPath);
       try {

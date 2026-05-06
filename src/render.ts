@@ -119,6 +119,11 @@ function renderListMemory(memory: MemoryRecord): string {
   return `${headerParts.join(" ")}\n  ${title}${sourceLine}${updatedLine}`;
 }
 
+function renderCompactMemory(memory: MemoryRecord): string {
+  const title = memory.title ? truncate(memory.title, 120) : truncate(memory.body.replace(/\s+/g, " ").trim(), 120);
+  return `- [${memory.id}] ${memory.status} ${memory.kind} ${memory.scopePath} — ${title}`;
+}
+
 function renderEventPayload(event: MemoryEvent): string {
   try {
     return truncate(JSON.stringify(JSON.parse(event.payloadJson), null, 2), 1_200);
@@ -190,6 +195,7 @@ export function renderMemoryInspect(result: PortiaInspectResult): string {
   lines.push(`Created: ${memory.createdAt}${memory.createdBy ? ` by ${memory.createdBy}` : ""}`);
   lines.push(`Updated: ${memory.updatedAt}`);
   if (memory.supersedesId) lines.push(`Supersedes: ${memory.supersedesId}`);
+  if (result.supersededBy.length > 0) lines.push(`Superseded by: ${result.supersededBy.map((item) => item.id).join(", ")}`);
   const source = renderMemorySource(memory);
   if (source) lines.push(`Source: ${source}`);
   lines.push("");
@@ -290,11 +296,15 @@ export function renderRecord(result: PortiaRecordResult): string {
   lines.push(`DB: ${result.dbPath}`);
   lines.push(`Write policy: ${result.writePolicy}`);
   if (result.modeOverride) lines.push(`PORTIA_MODE: ${result.modeOverride}`);
-  lines.push(`Status: ${result.written ? "written" : "proposal-only"}`);
+  const status = result.written ? "written" : result.skipReason === "duplicate" ? "duplicate-blocked" : "proposal-only";
+  lines.push(`Status: ${status}`);
   if (result.skipReason === "readonly") lines.push("Reason: readonly policy; no durable Portia write was made.");
   if (result.skipReason === "confirm") lines.push("Reason: confirm policy currently returns a proposal; no durable Portia write was made.");
+  if (result.skipReason === "duplicate") lines.push("Reason: exact duplicate protection prevented a durable Portia write.");
   if (result.memory) lines.push(`Memory: ${result.memory.id}`);
   if (result.event) lines.push(`Event: ${result.event.id}`);
+  if (result.supersededMemory) lines.push(`Superseded memory: ${result.supersededMemory.id}`);
+  if (result.supersedeEvent) lines.push(`Supersede event: ${result.supersedeEvent.id}`);
 
   if (result.warnings.length > 0) {
     lines.push("");
@@ -308,6 +318,8 @@ export function renderRecord(result: PortiaRecordResult): string {
   lines.push(`- kind: ${proposal.kind}`);
   lines.push(`- importance: ${proposal.importance}`);
   lines.push(`- confidence: ${proposal.confidence}`);
+  lines.push(`- duplicate policy: ${proposal.duplicatePolicy}`);
+  if (proposal.supersedesId) lines.push(`- supersedes: ${proposal.supersedesId}`);
   if (proposal.sourceType || proposal.sourceRef) {
     lines.push(`- source: ${[proposal.sourceType, proposal.sourceRef].filter(Boolean).join(":")}`);
   }
@@ -317,13 +329,25 @@ export function renderRecord(result: PortiaRecordResult): string {
   }
   lines.push("");
   lines.push(truncate(proposal.body, 900));
+  if (result.duplicateBlockedBy) {
+    lines.push("");
+    lines.push("## Exact Duplicate");
+    lines.push(renderCompactMemory(result.duplicateBlockedBy));
+  }
+
+  if (result.relatedMemories.length > 0) {
+    lines.push("");
+    lines.push("## Related Active Memories");
+    for (const memory of result.relatedMemories) lines.push(renderCompactMemory(memory));
+  }
+
   if (proposal.evidence) {
     lines.push("");
     lines.push("## Evidence");
     lines.push(truncate(proposal.evidence, 900));
   }
 
-  if (!result.written) {
+  if (!result.written && result.skipReason !== "duplicate") {
     lines.push("");
     lines.push("This is a structured proposal only. A main session with writePolicy=write can persist it with portia_record.");
   }

@@ -232,6 +232,146 @@ test("recordPortiaMemory returns proposals without writing in readonly and confi
   }
 });
 
+test("recordPortiaMemory blocks exact duplicate active memories by default", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  const writeSettings = settings(project, dbPath, {
+    writePolicy: "write",
+    effectiveWritePolicy: "write",
+  });
+  const input = {
+    scopePath: ".",
+    kind: "decision",
+    title: "Duplicate guard",
+    body: "Exact duplicate memories should not create parallel active records.",
+    sourceType: "test",
+    sourceRef: "duplicate",
+  };
+
+  try {
+    const first = recordPortiaMemory(db, writeSettings, input, project);
+    assert.equal(first.written, true);
+
+    const blocked = recordPortiaMemory(db, writeSettings, {
+      ...input,
+      body: "Exact   duplicate memories should not create parallel active records.",
+    }, project);
+    assert.equal(blocked.written, false);
+    assert.equal(blocked.skipReason, "duplicate");
+    assert.equal(blocked.duplicateBlockedBy?.id, first.memory.id);
+    assert.equal(blocked.memory?.id, first.memory.id);
+    assert.equal(db.getStats().activeMemories, 1);
+
+    const allowed = recordPortiaMemory(db, writeSettings, {
+      ...input,
+      duplicatePolicy: "warn",
+    }, project);
+    assert.equal(allowed.written, true);
+    assert.equal(allowed.warnings.some((warning) => warning.includes("duplicatePolicy=warn")), true);
+    assert.equal(db.getStats().activeMemories, 2);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("recordPortiaMemory reports related active memories without blocking fuzzy overlaps", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  const writeSettings = settings(project, dbPath, {
+    writePolicy: "write",
+    effectiveWritePolicy: "write",
+  });
+
+  try {
+    const existing = recordPortiaMemory(db, writeSettings, {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "FTS trigger maintenance",
+      body: "memory_fts triggers keep Portia search rows synchronized after memory writes.",
+      sourceType: "test",
+      sourceRef: "related-existing",
+    }, project);
+
+    const related = recordPortiaMemory(db, writeSettings, {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "FTS triggers require care",
+      body: "Before changing memory_fts triggers, verify Portia search rows stay synchronized.",
+      sourceType: "test",
+      sourceRef: "related-new",
+    }, project);
+
+    assert.equal(related.written, true);
+    assert.equal(related.relatedMemories.some((memory) => memory.id === existing.memory.id), true);
+    assert.equal(related.warnings.some((warning) => warning.includes("related active")), true);
+    assert.equal(db.getStats().activeMemories, 2);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("recordPortiaMemory can atomically supersede an active memory", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  const writeSettings = settings(project, dbPath, {
+    writePolicy: "write",
+    effectiveWritePolicy: "write",
+  });
+
+  try {
+    const oldMemory = recordPortiaMemory(db, writeSettings, {
+      scopePath: "pi-portia",
+      kind: "plan",
+      title: "Old memory quality plan",
+      body: "Old quality plan says manual deletion is handled only through repair commands.",
+      sourceType: "test",
+      sourceRef: "supersede-old",
+    }, project);
+
+    const replacement = recordPortiaMemory(db, writeSettings, {
+      scopePath: "pi-portia",
+      kind: "plan",
+      title: "New memory quality plan",
+      body: "New quality plan adds portia-delete and record-time supersession controls.",
+      supersedesId: oldMemory.memory.id,
+      sourceType: "test",
+      sourceRef: "supersede-new",
+      evidence: "Synthetic test verifies supersession lineage.",
+    }, project);
+
+    assert.equal(replacement.written, true);
+    assert.equal(replacement.memory?.supersedesId, oldMemory.memory.id);
+    assert.equal(replacement.supersededMemory?.id, oldMemory.memory.id);
+    assert.equal(replacement.supersededMemory?.status, "superseded");
+    assert.equal(replacement.supersedeEvent?.eventType, "status_changed");
+    assert.equal(db.getMemory(oldMemory.memory.id)?.status, "superseded");
+    assert.equal(db.getStats().activeMemories, 1);
+    assert.equal(db.getStats().supersededMemories, 1);
+
+    const payload = JSON.parse(replacement.supersedeEvent.payloadJson);
+    assert.equal(payload.action, "supersede");
+    assert.equal(payload.newStatus, "superseded");
+    assert.equal(payload.replacementId, replacement.memory.id);
+
+    const activeSense = senseMemories(db, settings(project, dbPath), {
+      path: "pi-portia",
+      query: "manual deletion repair commands",
+    }, project);
+    assert.equal(activeSense.memories.some((memory) => memory.id === oldMemory.memory.id), false);
+
+    const inspectedOld = inspectPortiaMemory(db, settings(project, dbPath), { id: oldMemory.memory.id });
+    assert.equal(inspectedOld.supersededBy.some((memory) => memory.id === replacement.memory.id), true);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("listPortiaMemories filters by status, scope, kind, and query", () => {
   const project = tempProject();
   const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
