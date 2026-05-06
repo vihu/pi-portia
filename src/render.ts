@@ -1,5 +1,17 @@
 import * as path from "node:path";
-import type { PortiaRecordResult, PortiaSettings, PortiaStats, RetrievedMemory, RetrievalSignal, SenseResult } from "./types.ts";
+import type {
+  MemoryEvent,
+  MemoryRecord,
+  PortiaInspectResult,
+  PortiaListResult,
+  PortiaRecordResult,
+  PortiaRepairResult,
+  PortiaSettings,
+  PortiaStats,
+  RetrievedMemory,
+  RetrievalSignal,
+  SenseResult,
+} from "./types.ts";
 
 function truncate(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
@@ -83,6 +95,166 @@ export function renderSense(result: SenseResult): string {
 
   lines.push("");
   lines.push("Reminder: Portia memories are pointers and gotchas, not source-of-truth replacements. Follow referenced files and commands.");
+  return lines.join("\n");
+}
+
+function renderMemorySource(memory: MemoryRecord): string | undefined {
+  const provenance = [memory.sourceType, memory.sourceRef].filter(Boolean).join(":");
+  return provenance || undefined;
+}
+
+function renderListMemory(memory: MemoryRecord): string {
+  const headerParts = [
+    `- [${memory.id}]`,
+    memory.status,
+    memory.kind,
+    memory.scopePath,
+    `importance=${memory.importance}`,
+    `confidence=${memory.confidence}`,
+  ];
+  const title = memory.title ? truncate(memory.title, 140) : truncate(memory.body.replace(/\s+/g, " ").trim(), 140);
+  const source = renderMemorySource(memory);
+  const sourceLine = source ? `\n  source: ${truncate(source, 180)}` : "";
+  const updatedLine = `\n  updated: ${memory.updatedAt}`;
+  return `${headerParts.join(" ")}\n  ${title}${sourceLine}${updatedLine}`;
+}
+
+function renderEventPayload(event: MemoryEvent): string {
+  try {
+    return truncate(JSON.stringify(JSON.parse(event.payloadJson), null, 2), 1_200);
+  } catch {
+    return truncate(event.payloadJson, 1_200);
+  }
+}
+
+function renderEvent(event: MemoryEvent): string {
+  const by = event.createdBy ? ` by ${event.createdBy}` : "";
+  return `- ${event.eventType} ${event.createdAt}${by}\n${renderEventPayload(event)}`;
+}
+
+export function renderMemoryList(result: PortiaListResult): string {
+  const lines: string[] = [];
+  lines.push("# Portia List");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Status: ${result.filters.status}`);
+  if (result.filters.scopePath) lines.push(`Scope: ${result.filters.scopePath}`);
+  if (result.filters.kind) lines.push(`Kind: ${result.filters.kind}`);
+  if (result.filters.query) lines.push(`Query: ${result.filters.query}`);
+  lines.push(`Limit: ${result.filters.limit}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  lines.push("");
+  lines.push(`## Memories (${result.memories.length})`);
+  if (result.memories.length === 0) {
+    lines.push("No Portia memories matched these filters.");
+  } else {
+    for (const memory of result.memories) {
+      lines.push("");
+      lines.push(renderListMemory(memory));
+    }
+  }
+
+  return lines.join("\n");
+}
+
+export function renderMemoryInspect(result: PortiaInspectResult): string {
+  const lines: string[] = [];
+  lines.push("# Portia Inspect");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`ID: ${result.id}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  const memory = result.memory;
+  if (!memory) return lines.join("\n");
+
+  lines.push("");
+  lines.push(`## Memory`);
+  lines.push(`[${memory.id}] ${memory.status} ${memory.kind} ${memory.scopePath}`);
+  if (memory.title) lines.push(`Title: ${memory.title}`);
+  lines.push(`Importance: ${memory.importance}`);
+  lines.push(`Confidence: ${memory.confidence}`);
+  lines.push(`Created: ${memory.createdAt}${memory.createdBy ? ` by ${memory.createdBy}` : ""}`);
+  lines.push(`Updated: ${memory.updatedAt}`);
+  if (memory.supersedesId) lines.push(`Supersedes: ${memory.supersedesId}`);
+  const source = renderMemorySource(memory);
+  if (source) lines.push(`Source: ${source}`);
+  lines.push("");
+  lines.push("Body:");
+  lines.push(memory.body);
+
+  lines.push("");
+  lines.push(`## Events (${result.events.length})`);
+  if (result.events.length === 0) {
+    lines.push("No memory events recorded for this memory.");
+  } else {
+    for (const event of result.events) {
+      lines.push("");
+      lines.push(renderEvent(event));
+    }
+  }
+
+  return lines.join("\n");
+}
+
+export function renderRepair(result: PortiaRepairResult): string {
+  const lines: string[] = [];
+  const proposal = result.proposal;
+
+  lines.push("# Portia Repair");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Write policy: ${result.writePolicy}`);
+  if (result.modeOverride) lines.push(`PORTIA_MODE: ${result.modeOverride}`);
+  lines.push(`Status: ${result.written ? "written" : "proposal-only"}`);
+  if (result.skipReason === "readonly") lines.push("Reason: readonly policy; no durable Portia write was made.");
+  if (result.skipReason === "confirm") lines.push("Reason: confirm policy currently returns a proposal; no durable Portia write was made.");
+  if (result.skipReason === "noop") lines.push("Reason: memory already has the requested status; no event was written.");
+  if (result.memory) lines.push(`Memory: ${result.memory.id}`);
+  if (result.event) lines.push(`Event: ${result.event.id}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  lines.push("");
+  lines.push("## Repair");
+  lines.push(`- id: ${proposal.id}`);
+  lines.push(`- action: ${proposal.action}`);
+  lines.push(`- current status: ${proposal.currentStatus ?? "unknown"}`);
+  lines.push(`- target status: ${proposal.targetStatus}`);
+  if (proposal.sourceType || proposal.sourceRef) {
+    lines.push(`- source: ${[proposal.sourceType, proposal.sourceRef].filter(Boolean).join(":")}`);
+  }
+  lines.push("");
+  lines.push(proposal.reason);
+  if (proposal.evidence) {
+    lines.push("");
+    lines.push("## Evidence");
+    lines.push(truncate(proposal.evidence, 900));
+  }
+
+  if (!result.written && result.skipReason !== "noop") {
+    lines.push("");
+    lines.push("This is a structured repair proposal only. A main session with writePolicy=write can apply it with portia_repair.");
+  }
+
   return lines.join("\n");
 }
 

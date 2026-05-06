@@ -8,11 +8,21 @@ export const MEMORY_KINDS = [
   "plan",
 ] as const;
 
+export const MEMORY_STATUSES = [
+  "active",
+  "superseded",
+  "stale",
+  "deleted",
+] as const;
+
 export type MemoryKind = typeof MEMORY_KINDS[number];
-export type MemoryStatus = "active" | "superseded" | "stale" | "deleted";
+export type MemoryStatus = typeof MEMORY_STATUSES[number];
+export type MemoryListStatus = MemoryStatus | "any";
 export type WritePolicy = "readonly" | "confirm" | "write";
 export type PortiaMode = WritePolicy | "off";
 export type PortiaRecordSkipReason = "readonly" | "confirm";
+export type PortiaRepairAction = "stale" | "delete" | "reactivate";
+export type PortiaRepairSkipReason = "readonly" | "confirm" | "noop";
 
 export interface PortiaSettings {
   enabled: boolean;
@@ -116,6 +126,91 @@ export interface PortiaRecordResult {
   memory?: MemoryRecord;
   event?: MemoryEvent;
   warnings: string[];
+}
+
+export interface MemoryListFilters {
+  status?: MemoryListStatus;
+  scopePath?: string;
+  kind?: MemoryKind | string;
+  query?: string;
+  limit?: number;
+}
+
+export interface PortiaListResult {
+  projectRoot: string;
+  dbPath: string;
+  filters: {
+    status: MemoryListStatus;
+    scopePath?: string;
+    kind?: MemoryKind;
+    query?: string;
+    limit: number;
+  };
+  memories: MemoryRecord[];
+  warnings: string[];
+}
+
+export interface PortiaInspectInput {
+  id: string;
+  includeEvents?: boolean;
+}
+
+export interface PortiaInspectResult {
+  projectRoot: string;
+  dbPath: string;
+  id: string;
+  memory?: MemoryRecord;
+  events: MemoryEvent[];
+  warnings: string[];
+}
+
+export interface PortiaRepairInput {
+  id: string;
+  action: PortiaRepairAction;
+  reason: string;
+  sourceType?: string;
+  sourceRef?: string;
+  evidence?: string;
+}
+
+export interface PortiaRepairProposal {
+  id: string;
+  action: PortiaRepairAction;
+  targetStatus: MemoryStatus;
+  reason: string;
+  sourceType?: string;
+  sourceRef?: string;
+  evidence?: string;
+  currentStatus?: string;
+}
+
+export interface PortiaRepairResult {
+  projectRoot: string;
+  dbPath: string;
+  writePolicy: WritePolicy;
+  modeOverride?: PortiaMode;
+  written: boolean;
+  skipReason?: PortiaRepairSkipReason;
+  proposal: PortiaRepairProposal;
+  memory?: MemoryRecord;
+  event?: MemoryEvent;
+  warnings: string[];
+}
+
+export interface UpdateMemoryStatusInput {
+  id: string;
+  status: MemoryStatus;
+  reason: string;
+  createdBy?: string;
+  sourceType?: string;
+  sourceRef?: string;
+  evidence?: string;
+  eventPayload?: Record<string, unknown>;
+}
+
+export interface UpdateMemoryStatusResult {
+  memory: MemoryRecord;
+  event: MemoryEvent;
 }
 
 export interface PortiaStats {

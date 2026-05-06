@@ -7,7 +7,10 @@ import Database from "better-sqlite3";
 import { buildAutopilotContext, extractPromptPathCandidates, renderAutopilotGuidance, selectAutopilotTarget } from "../src/autopilot.ts";
 import { resolvePortiaSettings } from "../src/config.ts";
 import { openPortiaDatabase } from "../src/db.ts";
+import { inspectPortiaMemory } from "../src/inspect.ts";
+import { listPortiaMemories } from "../src/list.ts";
 import { recordPortiaMemory } from "../src/record.ts";
+import { repairPortiaMemory } from "../src/repair.ts";
 import { senseMemories } from "../src/retrieval.ts";
 
 function tempProject() {
@@ -223,6 +226,206 @@ test("recordPortiaMemory returns proposals without writing in readonly and confi
     assert.equal(confirm.written, false);
     assert.equal(confirm.skipReason, "confirm");
     assert.equal(db.getStats().activeMemories, 0);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("listPortiaMemories filters by status, scope, kind, and query", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+
+  insertMemory(dbPath, {
+    id: "root-decision",
+    scope_path: ".",
+    kind: "decision",
+    title: "Root operating model",
+    body: "Main sessions write while worker sessions stay readonly.",
+    importance: 7,
+  });
+  insertMemory(dbPath, {
+    id: "auth-stale-gotcha",
+    scope_path: "src/auth",
+    kind: "gotcha",
+    title: "Old fixtures",
+    body: "Old seeded fixture note that should be stale.",
+    status: "stale",
+    importance: 3,
+  });
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    const active = listPortiaMemories(reopened, settings(project, dbPath), {}, project);
+    assert.deepEqual(active.memories.map((memory) => memory.id), ["root-decision"]);
+
+    const all = listPortiaMemories(reopened, settings(project, dbPath), { status: "any" }, project);
+    assert.deepEqual(new Set(all.memories.map((memory) => memory.id)), new Set(["root-decision", "auth-stale-gotcha"]));
+
+    const scoped = listPortiaMemories(reopened, settings(project, dbPath), {
+      status: "any",
+      scopePath: "src/auth",
+      kind: "gotcha",
+      query: "seeded fixture",
+    }, project);
+    assert.deepEqual(scoped.memories.map((memory) => memory.id), ["auth-stale-gotcha"]);
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("inspectPortiaMemory returns memory details and event history", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const recorded = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      scopePath: ".",
+      kind: "decision",
+      title: "Inspectable memory",
+      body: "Recorded memories should be inspectable with event provenance.",
+      sourceType: "test",
+      sourceRef: "inspect",
+    }, project);
+
+    const inspected = inspectPortiaMemory(db, settings(project, dbPath), { id: recorded.memory.id });
+    assert.equal(inspected.memory?.id, recorded.memory.id);
+    assert.equal(inspected.memory?.title, "Inspectable memory");
+    assert.equal(inspected.events.length, 1);
+    assert.equal(inspected.events[0].eventType, "created");
+
+    const missing = inspectPortiaMemory(db, settings(project, dbPath), { id: "missing-memory" });
+    assert.equal(missing.memory, undefined);
+    assert.equal(missing.warnings.some((warning) => warning.includes("No Portia memory")), true);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("repairPortiaMemory soft changes status, writes events, and active sense ignores inactive memories", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const recorded = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      scopePath: ".",
+      kind: "gotcha",
+      title: "Repair target",
+      body: "Temporary smoke memory should be hidden after repair deletes it.",
+      sourceType: "test",
+      sourceRef: "repair",
+    }, project);
+
+    const stale = repairPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      id: recorded.memory.id,
+      action: "stale",
+      reason: "Synthetic test mark stale.",
+      sourceType: "test",
+      sourceRef: "repair-stale",
+    });
+    assert.equal(stale.written, true);
+    assert.equal(stale.memory?.status, "stale");
+
+    const reactivated = repairPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      id: recorded.memory.id,
+      action: "reactivate",
+      reason: "Synthetic test reactivate.",
+    });
+    assert.equal(reactivated.written, true);
+    assert.equal(reactivated.memory?.status, "active");
+
+    const deleted = repairPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      id: recorded.memory.id,
+      action: "delete",
+      reason: "Synthetic test soft delete.",
+      evidence: "Deleted memories remain inspectable but are not active retrieval candidates.",
+    });
+    assert.equal(deleted.written, true);
+    assert.equal(deleted.memory?.status, "deleted");
+    assert.equal(deleted.event?.eventType, "status_changed");
+
+    const payload = JSON.parse(deleted.event.payloadJson);
+    assert.equal(payload.oldStatus, "active");
+    assert.equal(payload.newStatus, "deleted");
+    assert.equal(payload.repairAction, "delete");
+    assert.equal(db.getMemoryEvents(recorded.memory.id).length, 4);
+
+    const activeSense = senseMemories(db, settings(project, dbPath), {
+      path: ".",
+      query: "Temporary smoke memory",
+    }, project);
+    assert.equal(activeSense.memories.some((memory) => memory.id === recorded.memory.id), false);
+
+    const listedDeleted = listPortiaMemories(db, settings(project, dbPath), { status: "deleted" }, project);
+    assert.equal(listedDeleted.memories.at(0)?.id, recorded.memory.id);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("repairPortiaMemory returns proposals without writing in readonly and confirm policies", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const recorded = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      scopePath: ".",
+      kind: "gotcha",
+      title: "Repair proposal target",
+      body: "Readonly and confirm repair policies should not write status changes.",
+    }, project);
+
+    const readonly = repairPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "readonly",
+      modeOverride: "readonly",
+    }), {
+      id: recorded.memory.id,
+      action: "delete",
+      reason: "Readonly proposal only.",
+    });
+    assert.equal(readonly.written, false);
+    assert.equal(readonly.skipReason, "readonly");
+    assert.equal(db.getMemory(recorded.memory.id)?.status, "active");
+
+    const confirm = repairPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "confirm",
+      effectiveWritePolicy: "confirm",
+    }), {
+      id: recorded.memory.id,
+      action: "stale",
+      reason: "Confirm proposal only.",
+    });
+    assert.equal(confirm.written, false);
+    assert.equal(confirm.skipReason, "confirm");
+    assert.equal(db.getMemory(recorded.memory.id)?.status, "active");
+    assert.equal(db.getMemoryEvents(recorded.memory.id).length, 1);
   } finally {
     db.close();
     fs.rmSync(project, { recursive: true, force: true });

@@ -4,7 +4,16 @@ import * as path from "node:path";
 import Database from "better-sqlite3";
 
 type DatabaseConnection = InstanceType<typeof Database>;
-import type { CreateMemoryInput, CreateMemoryResult, MemoryEvent, MemoryRecord, PortiaStats } from "./types.ts";
+import type {
+  CreateMemoryInput,
+  CreateMemoryResult,
+  MemoryEvent,
+  MemoryListFilters,
+  MemoryRecord,
+  PortiaStats,
+  UpdateMemoryStatusInput,
+  UpdateMemoryStatusResult,
+} from "./types.ts";
 
 const SCHEMA_VERSION = 1;
 
@@ -82,6 +91,35 @@ function toEvent(row: EventRow): MemoryEvent {
     createdAt: row.created_at,
     createdBy: row.created_by ?? undefined,
   };
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
+function clampLimit(value: number | undefined, fallback: number): number {
+  if (!value || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(100, Math.floor(value)));
+}
+
+function memorySelectSql(): string {
+  return `
+    select rowid, id, scope_path, kind, title, body, status, importance, confidence,
+           created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+    from memories
+  `;
+}
+
+function memoryStatusOrderSql(): string {
+  return `
+    case status
+      when 'active' then 0
+      when 'stale' then 1
+      when 'superseded' then 2
+      when 'deleted' then 3
+      else 9
+    end
+  `;
 }
 
 function runMigrations(db: DatabaseConnection): void {
@@ -181,16 +219,19 @@ export class PortiaDatabase {
     this.db.close();
   }
 
-  private getMemoryById(id: string): MemoryRecord {
+  getMemory(id: string): MemoryRecord | undefined {
     const row = this.db.prepare(`
-      select rowid, id, scope_path, kind, title, body, status, importance, confidence,
-             created_at, updated_at, created_by, supersedes_id, source_type, source_ref
-      from memories
+      ${memorySelectSql()}
       where id = ?
     `).get(id) as MemoryRow | undefined;
 
-    if (!row) throw new Error(`Portia memory was not found after write: ${id}`);
-    return toMemory(row);
+    return row ? toMemory(row) : undefined;
+  }
+
+  private requireMemory(id: string): MemoryRecord {
+    const memory = this.getMemory(id);
+    if (!memory) throw new Error(`Portia memory was not found: ${id}`);
+    return memory;
   }
 
   private getEventById(id: string): MemoryEvent {
@@ -248,12 +289,105 @@ export class PortiaDatabase {
       });
 
       return {
-        memory: this.getMemoryById(id),
+        memory: this.requireMemory(id),
         event: this.getEventById(eventId),
       };
     });
 
     return insert();
+  }
+
+  listMemories(filters: MemoryListFilters = {}): MemoryRecord[] {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {
+      limit: clampLimit(filters.limit, 20),
+    };
+
+    if (filters.status && filters.status !== "any") {
+      clauses.push("status = @status");
+      params.status = filters.status;
+    }
+
+    if (filters.scopePath) {
+      clauses.push("scope_path = @scopePath");
+      params.scopePath = filters.scopePath;
+    }
+
+    if (filters.kind) {
+      clauses.push("kind = @kind");
+      params.kind = filters.kind;
+    }
+
+    if (filters.query?.trim()) {
+      clauses.push(`
+        lower(
+          coalesce(title, '') || ' ' || body || ' ' || scope_path || ' ' || kind || ' ' ||
+          coalesce(source_type, '') || ' ' || coalesce(source_ref, '')
+        ) like @query escape '\\'
+      `);
+      params.query = `%${escapeLike(filters.query.trim().toLowerCase())}%`;
+    }
+
+    const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
+    const rows = this.db.prepare(`
+      ${memorySelectSql()}
+      ${where}
+      order by ${memoryStatusOrderSql()} asc, importance desc, updated_at desc, id asc
+      limit @limit
+    `).all(params) as MemoryRow[];
+
+    return rows.map(toMemory);
+  }
+
+  searchMemories(query: string, filters: MemoryListFilters = {}): MemoryRecord[] {
+    return this.listMemories({ ...filters, query });
+  }
+
+  updateMemoryStatus(input: UpdateMemoryStatusInput): UpdateMemoryStatusResult {
+    const existing = this.requireMemory(input.id);
+    const eventId = randomUUID();
+    const now = new Date().toISOString();
+    const createdBy = input.createdBy ?? "portia";
+    const payloadJson = JSON.stringify({
+      ...(input.eventPayload ?? {}),
+      reason: input.reason,
+      oldStatus: existing.status,
+      newStatus: input.status,
+      sourceType: input.sourceType,
+      sourceRef: input.sourceRef,
+      evidence: input.evidence,
+    });
+
+    const update = this.db.transaction(() => {
+      this.db.prepare(`
+        update memories
+        set status = @status,
+            updated_at = @updatedAt
+        where id = @id
+      `).run({
+        id: input.id,
+        status: input.status,
+        updatedAt: now,
+      });
+
+      this.db.prepare(`
+        insert into memory_events (id, memory_id, event_type, payload_json, created_at, created_by)
+        values (@id, @memoryId, 'status_changed', @payloadJson, @createdAt, @createdBy)
+      `).run({
+        id: eventId,
+        memoryId: input.id,
+        payloadJson,
+        createdAt: now,
+        createdBy,
+      });
+
+      return {
+        memory: this.requireMemory(input.id),
+        event: this.getEventById(eventId),
+      };
+    });
+
+    return update();
   }
 
   getMemoryEvents(memoryId: string): MemoryEvent[] {

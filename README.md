@@ -14,13 +14,18 @@ Implemented now:
 - project-local DB at `.pi/portia/portia.sqlite`
 - `/portia-status`
 - `/portia-sense <path> [query]`
+- `/portia-list`
+- `/portia-inspect <id>`
+- `/portia-repair <id> <stale|delete|reactivate> <reason>`
 - `portia_sense` read-only tool
 - `portia_record` write/proposal tool
+- `portia_list` read-only tool
+- `portia_inspect` read-only tool
+- `portia_repair` write/proposal tool
 - turn-local autopilot guidance and bounded context injection
 
 Not implemented yet:
 
-- `portia_repair`
 - export/import
 - reflection/proposal workflow
 - vector search
@@ -69,9 +74,18 @@ You can still run explicit commands:
 ```text
 /portia-status
 /portia-sense src/auth token expiry
+/portia-list
+/portia-list all
+/portia-list kind decision
+/portia-list scope src/auth
+/portia-list query autopilot
+/portia-inspect <memory-id>
+/portia-repair <memory-id> delete Temporary test memory; safe to hide from active retrieval.
 ```
 
 `portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Treat the output as pointers to re-read source files and commands, not as complete ground truth.
+
+Use `portia_list`/`/portia-list` to browse memories, `portia_inspect`/`/portia-inspect` to view one memory with provenance and event history, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records.
 
 The main agent can call `portia_record` after verified durable project findings, for example:
 
@@ -121,14 +135,14 @@ Default public behavior is conservative: `writePolicy` defaults to `confirm`, wh
 ```jsonc
 {
   "portia": {
-    "writePolicy": "write"
+    "writePolicy": "write",
   },
   "pi-fork": {
-    "environment": { "PORTIA_MODE": "readonly" }
+    "environment": { "PORTIA_MODE": "readonly" },
   },
   "pi-minimal-subagent": {
-    "environment": { "PORTIA_MODE": "readonly" }
-  }
+    "environment": { "PORTIA_MODE": "readonly" },
+  },
 }
 ```
 
