@@ -1,4 +1,5 @@
 import type { PortiaDatabase } from "./db.ts";
+import { computeEffectivePheromoneStrength, computePheromoneBoost } from "./pheromones.ts";
 import type { PortiaInspectInput, PortiaInspectResult, PortiaSettings } from "./types.ts";
 
 const MAX_ID_LENGTH = 240;
@@ -18,6 +19,13 @@ export function inspectPortiaMemory(db: PortiaDatabase, settings: PortiaSettings
   const includeEvents = input.includeEvents ?? true;
   const events = memory && includeEvents ? db.getMemoryEvents(id) : [];
   const supersededBy = memory ? db.getMemoriesSuperseding(id) : [];
+  const pheromone = memory ? db.getMemoryPheromone(id) : undefined;
+  const pheromoneEffectiveStrength = pheromone
+    ? computeEffectivePheromoneStrength(pheromone, settings.pheromoneHalfLifeDays)
+    : undefined;
+  const pheromoneBoost = pheromoneEffectiveStrength !== undefined
+    ? computePheromoneBoost(pheromoneEffectiveStrength, settings.pheromoneMaxBoost)
+    : undefined;
   const warnings: string[] = [];
 
   if (!memory) warnings.push("No Portia memory found for this id. Try /portia-list query <term> to search.");
@@ -29,6 +37,9 @@ export function inspectPortiaMemory(db: PortiaDatabase, settings: PortiaSettings
     memory,
     events,
     supersededBy,
+    pheromone,
+    pheromoneEffectiveStrength,
+    pheromoneBoost,
     warnings,
   };
 }

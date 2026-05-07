@@ -24,6 +24,18 @@ export type PortiaRecordSkipReason = "readonly" | "confirm" | "duplicate";
 export type PortiaDuplicatePolicy = "warn" | "blockExact";
 export type PortiaRepairAction = "stale" | "delete" | "reactivate";
 export type PortiaRepairSkipReason = "readonly" | "confirm" | "noop";
+export type PheromoneWorkerPolicy = "off" | "low" | "write";
+export type PheromoneTraceEventType =
+  | "exposed"
+  | "followed_scope"
+  | "followed_source_ref"
+  | "ignored"
+  | "validation_passed"
+  | "validation_failed"
+  | "manual_repair"
+  | "manual_delete"
+  | "superseded"
+  | "decayed";
 
 export interface PortiaSettings {
   enabled: boolean;
@@ -40,6 +52,16 @@ export interface PortiaSettings {
   autoSense: boolean;
   autoSenseMaxResults: number;
   autoSenseMaxChars: number;
+  enablePheromones: boolean;
+  pheromoneRanking: boolean;
+  pheromoneHalfLifeDays: number;
+  pheromoneMaxBoost: number;
+  pheromoneFollowWeight: number;
+  pheromoneSuccessWeight: number;
+  pheromoneFailureWeight: number;
+  pheromoneIgnoredWeight: number;
+  pheromoneWorkerPolicy: PheromoneWorkerPolicy;
+  traceRetentionDays: number;
   modeOverride?: PortiaMode;
   projectRoot: string;
   globalSettingsPath: string;
@@ -71,6 +93,85 @@ export interface MemoryEvent {
   payloadJson: string;
   createdAt: string;
   createdBy?: string;
+}
+
+export interface MemoryPheromone {
+  memoryId: string;
+  strength: number;
+  exposedCount: number;
+  followedCount: number;
+  ignoredCount: number;
+  successCount: number;
+  failureCount: number;
+  lastExposedAt?: string;
+  lastFollowedAt?: string;
+  lastIgnoredAt?: string;
+  lastSuccessAt?: string;
+  lastFailureAt?: string;
+  lastDecayedAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryPheromoneSummary extends MemoryPheromone {
+  memory?: MemoryRecord;
+  effectiveStrength?: number;
+  boost?: number;
+}
+
+export interface MemoryTraceEvent {
+  id: string;
+  memoryId: string;
+  eventType: PheromoneTraceEventType | string;
+  scopePath?: string;
+  toolName?: string;
+  toolCallId?: string;
+  sessionFile?: string;
+  turnId?: string;
+  weight: number;
+  payloadJson: string;
+  createdAt: string;
+}
+
+export interface RecordTraceEventInput {
+  memoryId: string;
+  eventType: PheromoneTraceEventType | string;
+  scopePath?: string;
+  toolName?: string;
+  toolCallId?: string;
+  sessionFile?: string;
+  turnId?: string;
+  weight?: number;
+  payload?: Record<string, unknown>;
+  createdAt?: string;
+}
+
+export interface ApplyPheromoneDeltaInput {
+  memoryId: string;
+  eventType: PheromoneTraceEventType | string;
+  delta: number;
+  halfLifeDays?: number;
+  createdAt?: string;
+}
+
+export interface ListPheromonesFilters {
+  mode?: "top" | "weak";
+  limit?: number;
+}
+
+export interface PortiaTrailsInput {
+  mode?: "top" | "weak" | "recent" | "memory";
+  memoryId?: string;
+  limit?: number;
+}
+
+export interface PortiaTrailsResult {
+  projectRoot: string;
+  dbPath: string;
+  mode: "top" | "weak" | "recent" | "memory";
+  memoryId?: string;
+  pheromones: MemoryPheromoneSummary[];
+  events: MemoryTraceEvent[];
+  warnings: string[];
 }
 
 export interface CreateMemoryInput {
@@ -181,6 +282,9 @@ export interface PortiaInspectResult {
   memory?: MemoryRecord;
   events: MemoryEvent[];
   supersededBy: MemoryRecord[];
+  pheromone?: MemoryPheromone;
+  pheromoneEffectiveStrength?: number;
+  pheromoneBoost?: number;
   warnings: string[];
 }
 
@@ -242,12 +346,15 @@ export interface PortiaStats {
   supersededMemories: number;
   deletedMemories: number;
   ftsAvailable: boolean;
+  pheromoneTraceEvents: number;
+  pheromoneMemoryCount: number;
+  reinforcedMemories: number;
   byKind: Array<{ kind: string; count: number }>;
   topScopes: Array<{ scopePath: string; count: number }>;
 }
 
 export interface RetrievalSignal {
-  type: "proximity" | "dependency" | "chord";
+  type: "proximity" | "dependency" | "chord" | "pheromone";
   scopePath?: string;
   strength?: number;
   score?: number;
@@ -259,6 +366,9 @@ export interface RetrievedMemory extends MemoryRecord {
   rank: number;
   reasons: RetrievalSignal[];
   ftsScore?: number;
+  pheromoneStrength?: number;
+  pheromoneEffectiveStrength?: number;
+  pheromoneBoost?: number;
 }
 
 export interface SenseInput {

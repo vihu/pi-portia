@@ -9,9 +9,11 @@ import { resolvePortiaSettings } from "../src/config.ts";
 import { openPortiaDatabase } from "../src/db.ts";
 import { inspectPortiaMemory } from "../src/inspect.ts";
 import { listPortiaMemories } from "../src/list.ts";
+import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, shouldWritePheromones } from "../src/pheromones.ts";
 import { recordPortiaMemory } from "../src/record.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
 import { senseMemories } from "../src/retrieval.ts";
+import { listPortiaTrails } from "../src/trails.ts";
 
 function tempProject() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-portia-test-"));
@@ -70,6 +72,16 @@ function settings(projectRoot, dbPath, overrides = {}) {
     autoSense: true,
     autoSenseMaxResults: 5,
     autoSenseMaxChars: 2500,
+    enablePheromones: true,
+    pheromoneRanking: true,
+    pheromoneHalfLifeDays: 30,
+    pheromoneMaxBoost: 25,
+    pheromoneFollowWeight: 1,
+    pheromoneSuccessWeight: 2,
+    pheromoneFailureWeight: -0.4,
+    pheromoneIgnoredWeight: 0,
+    pheromoneWorkerPolicy: "off",
+    traceRetentionDays: 180,
     projectRoot,
     globalSettingsPath: path.join(projectRoot, "global-settings.json"),
     projectSettingsPath: path.join(projectRoot, ".pi", "settings.json"),
@@ -84,7 +96,7 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
   const db = openPortiaDatabase(dbPath);
   try {
     const stats = db.getStats();
-    assert.equal(stats.schemaVersion, 1);
+    assert.equal(stats.schemaVersion, 2);
     assert.equal(stats.ftsAvailable, true);
     assert.equal(stats.totalMemories, 0);
   } finally {
@@ -138,7 +150,7 @@ test("senseMemories ranks proximity, dependency, and FTS memories", () => {
 
   const reopened = openPortiaDatabase(dbPath);
   try {
-    const result = senseMemories(reopened, settings(project, dbPath), {
+    const result = senseMemories(reopened, settings(project, dbPath, { pheromoneRanking: false }), {
       path: "src/auth/session.ts",
       query: "database fixtures",
     }, project);
@@ -149,6 +161,307 @@ test("senseMemories ranks proximity, dependency, and FTS memories", () => {
     assert.equal(result.signals.some((signal) => signal.type === "chord"), true);
   } finally {
     reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("pheromone trace events update summary counts without exposure self-reinforcement", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const memory = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "Schema trace target",
+      body: "Read src/db.ts before changing Portia schema migrations.",
+    }, project).memory;
+
+    db.recordTraceEvent({ memoryId: memory.id, eventType: "exposed", scopePath: "src/db.ts", weight: 0 });
+    db.applyPheromoneDelta({ memoryId: memory.id, eventType: "exposed", delta: 0 });
+    db.recordTraceEvent({ memoryId: memory.id, eventType: "ignored", scopePath: "src/db.ts", weight: 0 });
+    db.applyPheromoneDelta({ memoryId: memory.id, eventType: "ignored", delta: 0 });
+
+    const pheromone = db.getMemoryPheromone(memory.id);
+    assert.equal(pheromone.strength, 0);
+    assert.equal(pheromone.exposedCount, 1);
+    assert.equal(pheromone.ignoredCount, 1);
+    assert.equal(db.getTraceEventsForMemory(memory.id).length, 2);
+    assert.equal(db.getStats().pheromoneTraceEvents, 2);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("pheromone trace state uses tool_call order when validation result finishes before read result", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db.ts"), "export const schema = true;\n");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const writeSettings = settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    });
+    const memory = recordPortiaMemory(db, writeSettings, {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "Schema migration gotcha",
+      body: "Inspect src/db.ts and run typecheck after changing Portia schema migrations.",
+    }, project).memory;
+
+    const sense = senseMemories(db, writeSettings, { path: "src/db.ts", query: "schema migrations" }, project);
+    const trace = createPheromoneTraceState(writeSettings, "Change src/db.ts schema migrations", "test-session.jsonl");
+    addSenseExposures(trace, sense, "autopilot");
+    observeToolCall(trace, { toolName: "read", toolCallId: "read-1" });
+    observeToolCall(trace, { toolName: "bash", toolCallId: "bash-1" });
+    observeToolResult(trace, writeSettings, {
+      toolName: "bash",
+      toolCallId: "bash-1",
+      input: { command: "npm run typecheck" },
+      isError: false,
+      cwd: project,
+    });
+    observeToolResult(trace, writeSettings, {
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "src/db.ts" },
+      isError: false,
+      cwd: project,
+    });
+
+    const flushed = flushPheromoneTraceState(db, writeSettings, trace);
+    assert.equal(flushed.exposed, 1);
+    assert.equal(flushed.followed, 1);
+    assert.equal(flushed.validations, 1);
+
+    const pheromone = db.getMemoryPheromone(memory.id);
+    assert.equal(pheromone.exposedCount, 1);
+    assert.equal(pheromone.followedCount, 1);
+    assert.equal(pheromone.successCount, 1);
+    assert.equal(pheromone.strength, 3);
+
+    const trails = listPortiaTrails(db, writeSettings, { mode: "top" });
+    assert.equal(trails.pheromones.at(0)?.memoryId, memory.id);
+    assert.equal(trails.pheromones.at(0)?.boost > 0, true);
+
+    const inspected = inspectPortiaMemory(db, writeSettings, { id: memory.id });
+    assert.equal(inspected.pheromone?.strength, 3);
+    assert.equal(inspected.pheromoneBoost > 0, true);
+    const inspectedWithLowerMaxBoost = inspectPortiaMemory(db, settings(project, dbPath, { pheromoneMaxBoost: 5 }), { id: memory.id });
+    assert.equal(inspectedWithLowerMaxBoost.pheromoneBoost < inspected.pheromoneBoost, true);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("pheromone failed validation applies weak negative delta after follow", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db.ts"), "export const schema = true;\n");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const writeSettings = settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    });
+    const memory = recordPortiaMemory(db, writeSettings, {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "Validation failure gotcha",
+      body: "Inspect src/db.ts and run typecheck after schema changes.",
+    }, project).memory;
+
+    const sense = senseMemories(db, writeSettings, { path: "src/db.ts" }, project);
+    const trace = createPheromoneTraceState(writeSettings, "Change src/db.ts schema migrations");
+    addSenseExposures(trace, sense, "autopilot");
+    observeToolResult(trace, writeSettings, {
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "src/db.ts" },
+      isError: false,
+      cwd: project,
+    });
+    observeToolResult(trace, writeSettings, {
+      toolName: "bash",
+      toolCallId: "bash-1",
+      input: { command: "npm run typecheck" },
+      isError: true,
+      cwd: project,
+    });
+
+    const flushed = flushPheromoneTraceState(db, writeSettings, trace);
+    assert.equal(flushed.validations, 1);
+
+    const pheromone = db.getMemoryPheromone(memory.id);
+    assert.equal(pheromone.failureCount, 1);
+    assert.equal(Math.abs(pheromone.strength - 0.6) < 0.000001, true);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("readonly worker policy low applies reduced pheromone weights", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db.ts"), "export const schema = true;\n");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const writeSettings = settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    });
+    const memory = recordPortiaMemory(db, writeSettings, {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "Worker low weight gotcha",
+      body: "Inspect src/db.ts before schema changes.",
+    }, project).memory;
+    const workerSettings = settings(project, dbPath, {
+      effectiveWritePolicy: "readonly",
+      modeOverride: "readonly",
+      pheromoneWorkerPolicy: "low",
+    });
+
+    const sense = senseMemories(db, writeSettings, { path: "src/db.ts" }, project);
+    const trace = createPheromoneTraceState(workerSettings, "Worker inspects src/db.ts");
+    addSenseExposures(trace, sense, "autopilot");
+    observeToolResult(trace, workerSettings, {
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "src/db.ts" },
+      isError: false,
+      cwd: project,
+    });
+
+    assert.equal(shouldWritePheromones(workerSettings), true);
+    flushPheromoneTraceState(db, workerSettings, trace);
+
+    const pheromone = db.getMemoryPheromone(memory.id);
+    assert.equal(pheromone.followedCount, 1);
+    assert.equal(pheromone.strength, 0.25);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("trace retention prunes old raw trace events", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const memory = recordPortiaMemory(db, settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    }), {
+      scopePath: "src/db.ts",
+      kind: "gotcha",
+      title: "Retention gotcha",
+      body: "Old raw trace events should be pruned.",
+    }, project).memory;
+
+    db.recordTraceEvent({
+      memoryId: memory.id,
+      eventType: "exposed",
+      weight: 0,
+      createdAt: "2020-01-01T00:00:00.000Z",
+    });
+    db.recordTraceEvent({
+      memoryId: memory.id,
+      eventType: "followed_scope",
+      weight: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const pruned = db.pruneTraceEvents(30, new Date("2026-01-15T00:00:00.000Z"));
+    assert.equal(pruned, 1);
+    assert.equal(db.getTraceEventsForMemory(memory.id, 10).length, 1);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("pheromone ranking boosts only already relevant candidates and can be disabled", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db.ts"), "export const schema = true;\n");
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+
+  insertMemory(dbPath, {
+    id: "important-base",
+    scope_path: "src",
+    kind: "gotcha",
+    body: "High importance unreinforced memory for schema work.",
+    importance: 5,
+  });
+  insertMemory(dbPath, {
+    id: "reinforced-route",
+    scope_path: "src",
+    kind: "gotcha",
+    body: "Lower importance memory repeatedly followed for schema work.",
+    importance: 0,
+  });
+  insertMemory(dbPath, {
+    id: "unrelated-reinforced",
+    scope_path: "docs",
+    kind: "gotcha",
+    body: "Unrelated reinforced memory must not appear unless it is a candidate.",
+    importance: 0,
+  });
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    reopened.applyPheromoneDelta({ memoryId: "reinforced-route", eventType: "validation_passed", delta: 20 });
+    reopened.applyPheromoneDelta({ memoryId: "unrelated-reinforced", eventType: "validation_passed", delta: 20 });
+
+    const disabled = senseMemories(reopened, settings(project, dbPath, { pheromoneRanking: false }), {
+      path: "src/db.ts",
+    }, project);
+    assert.equal(disabled.memories.at(0)?.id, "important-base");
+    assert.equal(disabled.memories.some((memory) => memory.id === "unrelated-reinforced"), false);
+
+    const enabled = senseMemories(reopened, settings(project, dbPath, { pheromoneRanking: true }), {
+      path: "src/db.ts",
+    }, project);
+    assert.equal(enabled.memories.at(0)?.id, "reinforced-route");
+    assert.equal(enabled.memories.at(0)?.reasons.some((reason) => reason.type === "pheromone"), true);
+    assert.equal(enabled.memories.some((memory) => memory.id === "unrelated-reinforced"), false);
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("readonly worker policy off disables pheromone writes", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const readonlySettings = settings(project, dbPath, {
+    effectiveWritePolicy: "readonly",
+    modeOverride: "readonly",
+    pheromoneWorkerPolicy: "off",
+  });
+
+  try {
+    assert.equal(shouldWritePheromones(readonlySettings), false);
+  } finally {
     fs.rmSync(project, { recursive: true, force: true });
   }
 });
@@ -662,6 +975,14 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
         autoSense: false,
         autoSenseMaxResults: 99,
         autoSenseMaxChars: 99_999,
+        enablePheromones: false,
+        pheromoneRanking: false,
+        pheromoneHalfLifeDays: 45,
+        pheromoneMaxBoost: 30,
+        pheromoneFailureWeight: -0.2,
+        pheromoneIgnoredWeight: -0.1,
+        pheromoneWorkerPolicy: "low",
+        traceRetentionDays: 400,
       },
     }));
     process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -672,6 +993,14 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
     assert.equal(resolved.autoSense, false);
     assert.equal(resolved.autoSenseMaxResults, 12);
     assert.equal(resolved.autoSenseMaxChars, 12_000);
+    assert.equal(resolved.enablePheromones, false);
+    assert.equal(resolved.pheromoneRanking, false);
+    assert.equal(resolved.pheromoneHalfLifeDays, 45);
+    assert.equal(resolved.pheromoneMaxBoost, 30);
+    assert.equal(resolved.pheromoneFailureWeight, -0.2);
+    assert.equal(resolved.pheromoneIgnoredWeight, -0.1);
+    assert.equal(resolved.pheromoneWorkerPolicy, "low");
+    assert.equal(resolved.traceRetentionDays, 400);
   } finally {
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir;

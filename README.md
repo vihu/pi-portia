@@ -24,6 +24,9 @@ Implemented now:
 - `portia_inspect` read-only tool
 - `portia_repair` write/proposal tool
 - turn-local autopilot guidance and bounded context injection
+- automatic pheromone trace capture for exposed/followed/validated memories
+- conservative pheromone-aware retrieval ranking with visible `PHEROMONE` signals
+- `/portia-trails` pheromone trail browser
 
 Not implemented yet:
 
@@ -81,13 +84,16 @@ You can still run explicit commands:
 /portia-list scope src/auth
 /portia-list query autopilot
 /portia-inspect <memory-id>
+/portia-trails
+/portia-trails recent
+/portia-trails memory <memory-id>
 /portia-repair <memory-id> delete Temporary test memory; safe to hide from active retrieval.
 /portia-delete <memory-id> Temporary test memory; safe to hide from active retrieval.
 ```
 
-`portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Treat the output as pointers to re-read source files and commands, not as complete ground truth.
+`portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Treat the output as pointers to re-read source files and commands, not as complete ground truth. When pheromones are enabled, reinforced memories may receive a bounded `PHEROMONE` boost, but only after they were already selected by normal proximity/dependency/FTS candidate generation.
 
-Use `portia_list`/`/portia-list` to browse memories, `portia_inspect`/`/portia-inspect` to view one memory with provenance and event history, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records. `/portia-delete <id> <reason>` is a shorter human-facing alias for soft deletion.
+Use `portia_list`/`/portia-list` to browse memories, `portia_inspect`/`/portia-inspect` to view one memory with provenance, event history, and a compact pheromone summary, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records. `/portia-delete <id> <reason>` is a shorter human-facing alias for soft deletion. Use `/portia-trails` to inspect reinforced, weak, recent, or per-memory pheromone traces.
 
 The main agent can call `portia_record` after verified durable project findings, for example:
 
@@ -121,6 +127,16 @@ Global settings live in Pi's agent settings file. Project settings live in `.pi/
     "autoSense": true,
     "autoSenseMaxResults": 5,
     "autoSenseMaxChars": 2500,
+    "enablePheromones": true,
+    "pheromoneRanking": true,
+    "pheromoneHalfLifeDays": 30,
+    "pheromoneMaxBoost": 25,
+    "pheromoneFollowWeight": 1,
+    "pheromoneSuccessWeight": 2,
+    "pheromoneFailureWeight": -0.4,
+    "pheromoneIgnoredWeight": 0,
+    "pheromoneWorkerPolicy": "off",
+    "traceRetentionDays": 180,
   },
 }
 ```
@@ -158,7 +174,22 @@ Autopilot settings:
 - `autoSenseMaxResults`: max memories in that pack, capped at 12
 - `autoSenseMaxChars`: max rendered pack size, capped at 12000
 
-Autopilot does not run a background summarizer or silently write memories by itself. It makes the agent more likely to sense and record intentionally.
+Autopilot does not run a background summarizer or silently write semantic memories by itself. It makes the agent more likely to sense and record intentionally.
+
+Pheromone settings:
+
+- `enablePheromones`: record behavioral traces and summary pheromone strength
+- `pheromoneRanking`: allow bounded pheromone boosts in `portia_sense` ranking; set false for debug/dark-mode operation
+- `pheromoneHalfLifeDays`: lazy decay half-life for stored strength
+- `pheromoneMaxBoost`: maximum rank points a positive pheromone can contribute
+- `pheromoneFollowWeight`: weight when an exposed memory's scope/source is read or edited
+- `pheromoneSuccessWeight`: additional weight when validation passes after following a memory
+- `pheromoneFailureWeight`: weak negative weight when validation fails after following a memory
+- `pheromoneIgnoredWeight`: weight for exposed-but-unfollowed memories; default `0`
+- `pheromoneWorkerPolicy`: `off`, `low`, or `write` behavior when the effective write policy is readonly
+- `traceRetentionDays`: retention horizon for raw trace events
+
+Pheromones adjust salience of existing active memories. They do not create new semantic memories automatically.
 
 ## Development
 

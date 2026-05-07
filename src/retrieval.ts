@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { dependencyScopesForFile } from "./dependencies.ts";
 import type { PortiaDatabase } from "./db.ts";
+import { computeEffectivePheromoneStrength, computePheromoneBoost } from "./pheromones.ts";
 import { isPathInside, normalizeScopePath, toProjectRelative } from "./root.ts";
 import type { MemoryRecord, PortiaSettings, RetrievedMemory, RetrievalSignal, SenseInput, SenseResult } from "./types.ts";
 
@@ -106,13 +107,13 @@ function addCandidate(candidates: Map<string, Candidate>, memory: MemoryRecord, 
   });
 }
 
-function rankCandidate(candidate: Candidate): number {
+function rankCandidate(candidate: Candidate, pheromoneBoost: number): number {
   const bestStrength = Math.max(0, ...candidate.reasons.map((reason) => reason.strength ?? 0));
   const hasFts = candidate.ftsScore !== undefined;
   const ftsWeight = hasFts ? 35 : 0;
   const kindWeight = KIND_WEIGHTS[candidate.memory.kind] ?? 8;
   const importanceWeight = candidate.memory.importance * 4;
-  return bestStrength + ftsWeight + kindWeight + importanceWeight + recencyWeight(candidate.memory.updatedAt);
+  return bestStrength + ftsWeight + kindWeight + importanceWeight + recencyWeight(candidate.memory.updatedAt) + pheromoneBoost;
 }
 
 function summarizeSignals(items: Array<{ reasons: RetrievalSignal[] }>): RetrievalSignal[] {
@@ -192,13 +193,39 @@ export function senseMemories(db: PortiaDatabase, settings: PortiaSettings, inpu
     }
   }
 
+  const pheromones = settings.enablePheromones && settings.pheromoneRanking
+    ? db.getMemoryPheromones([...candidates.keys()])
+    : new Map();
+
   const ranked: RetrievedMemory[] = [...candidates.values()]
-    .map((candidate) => ({
-      ...candidate.memory,
-      reasons: candidate.reasons,
-      ftsScore: candidate.ftsScore,
-      rank: rankCandidate(candidate),
-    }))
+    .map((candidate) => {
+      const pheromone = pheromones.get(candidate.memory.id);
+      const effectiveStrength = pheromone
+        ? computeEffectivePheromoneStrength(pheromone, settings.pheromoneHalfLifeDays)
+        : undefined;
+      const pheromoneBoost = effectiveStrength !== undefined
+        ? computePheromoneBoost(effectiveStrength, settings.pheromoneMaxBoost)
+        : 0;
+      const reasons = [...candidate.reasons];
+      if (pheromoneBoost > 0.01 && effectiveStrength !== undefined) {
+        reasons.push({
+          type: "pheromone",
+          query: "reinforced",
+          strength: Number(pheromoneBoost.toFixed(2)),
+          score: Number(effectiveStrength.toFixed(3)),
+        });
+      }
+
+      return {
+        ...candidate.memory,
+        reasons,
+        ftsScore: candidate.ftsScore,
+        pheromoneStrength: pheromone?.strength,
+        pheromoneEffectiveStrength: effectiveStrength,
+        pheromoneBoost: pheromoneBoost || undefined,
+        rank: rankCandidate(candidate, pheromoneBoost),
+      };
+    })
     .sort((a, b) => {
       if (b.rank !== a.rank) return b.rank - a.rank;
       if (b.importance !== a.importance) return b.importance - a.importance;

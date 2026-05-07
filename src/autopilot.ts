@@ -4,7 +4,7 @@ import type { PortiaDatabase } from "./db.ts";
 import { renderAutopilotContext } from "./render.ts";
 import { senseMemories } from "./retrieval.ts";
 import { isPathInside, toProjectRelative } from "./root.ts";
-import type { PortiaSettings } from "./types.ts";
+import type { PortiaSettings, SenseResult } from "./types.ts";
 
 const MAX_QUERY_CHARS = 500;
 const PATH_TOKEN_RE = /@?[A-Za-z0-9._~/-]+/g;
@@ -14,6 +14,11 @@ export interface AutopilotTarget {
   path: string;
   includeDependencies: boolean;
   matchedPromptPath?: string;
+}
+
+export interface AutopilotContextResult {
+  result: SenseResult;
+  rendered: string;
 }
 
 function truncate(text: string, maxLength: number): string {
@@ -129,7 +134,7 @@ export function renderAutopilotGuidance(settings: PortiaSettings): string | unde
   return lines.join("\n");
 }
 
-export function buildAutopilotContext(db: PortiaDatabase, settings: PortiaSettings, prompt: string, cwd: string): string | undefined {
+export function buildAutopilotContextResult(db: PortiaDatabase, settings: PortiaSettings, prompt: string, cwd: string): AutopilotContextResult | undefined {
   if (!settings.autoSense) return undefined;
 
   const target = selectAutopilotTarget(settings, prompt, cwd);
@@ -139,6 +144,11 @@ export function buildAutopilotContext(db: PortiaDatabase, settings: PortiaSettin
     includeDependencies: target.includeDependencies,
     limit: settings.autoSenseMaxResults,
   }, cwd);
+  const rendered = renderAutopilotContext(result, settings.autoSenseMaxChars);
+  if (!rendered) return undefined;
+  return { result, rendered };
+}
 
-  return renderAutopilotContext(result, settings.autoSenseMaxChars);
+export function buildAutopilotContext(db: PortiaDatabase, settings: PortiaSettings, prompt: string, cwd: string): string | undefined {
+  return buildAutopilotContextResult(db, settings, prompt, cwd)?.rendered;
 }

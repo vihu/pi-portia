@@ -1,19 +1,22 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { buildAutopilotContext, renderAutopilotGuidance } from "./autopilot.ts";
+import { buildAutopilotContextResult, renderAutopilotGuidance } from "./autopilot.ts";
 import { resolvePortiaSettings } from "./config.ts";
 import { openPortiaDatabase } from "./db.ts";
 import { inspectPortiaMemory } from "./inspect.ts";
 import { listPortiaMemories } from "./list.ts";
+import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, recordSenseExposureOnly, shouldWritePheromones } from "./pheromones.ts";
+import type { PheromoneTraceState } from "./pheromones.ts";
 import { repairPortiaMemory } from "./repair.ts";
-import { renderMemoryInspect, renderMemoryList, renderRepair, renderSense, renderStatus } from "./render.ts";
+import { renderMemoryInspect, renderMemoryList, renderRepair, renderSense, renderStatus, renderTrails } from "./render.ts";
 import { senseMemories } from "./retrieval.ts";
+import { listPortiaTrails } from "./trails.ts";
 import { registerPortiaInspectTool } from "./tools/inspect.ts";
 import { registerPortiaListTool } from "./tools/list.ts";
 import { registerPortiaRecordTool } from "./tools/record.ts";
 import { registerPortiaRepairTool } from "./tools/repair.ts";
 import { registerPortiaSenseTool } from "./tools/sense.ts";
-import type { MemoryListStatus, PortiaRepairAction } from "./types.ts";
+import type { MemoryListStatus, PortiaRepairAction, PortiaTrailsInput, SenseResult } from "./types.ts";
 import type { PortiaListInput } from "./list.ts";
 
 function parseSenseArgs(args: string): { path: string; query?: string } {
@@ -111,6 +114,47 @@ function parseDeleteArgs(args: string): { id: string; action: "delete"; reason: 
   return { id, action: "delete", reason, sourceType: "command", sourceRef: "/portia-delete" };
 }
 
+function parseTrailsArgs(args: string): PortiaTrailsInput {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  const input: PortiaTrailsInput = {};
+  if (tokens.length === 0) return input;
+
+  const mode = tokens[0].toLowerCase();
+  if (mode === "top" || mode === "weak" || mode === "recent") {
+    input.mode = mode;
+    if (tokens.length > 2) throw new Error(`Usage: /portia-trails ${mode} [limit]`);
+    if (tokens[1]) {
+      const limit = Number(tokens[1]);
+      if (!Number.isInteger(limit)) throw new Error(`Usage: /portia-trails ${mode} [limit]`);
+      input.limit = limit;
+    }
+    return input;
+  }
+
+  if (mode === "memory") {
+    const memoryId = tokens[1];
+    if (!memoryId || tokens.length > 3) throw new Error("Usage: /portia-trails memory <memory-id> [limit]");
+    input.mode = "memory";
+    input.memoryId = memoryId;
+    if (tokens[2]) {
+      const limit = Number(tokens[2]);
+      if (!Number.isInteger(limit)) throw new Error("Usage: /portia-trails memory <memory-id> [limit]");
+      input.limit = limit;
+    }
+    return input;
+  }
+
+  const limit = Number(tokens[0]);
+  if (Number.isInteger(limit) && tokens.length === 1) return { limit };
+  throw new Error("Usage: /portia-trails [top|weak|recent|memory <memory-id>] [limit]");
+}
+
+function isSenseResult(value: unknown): value is SenseResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { memories?: unknown; targetScope?: unknown };
+  return Array.isArray(candidate.memories) && typeof candidate.targetScope === "string";
+}
+
 function appendPromptSection(systemPrompt: string, section: string): string {
   return `${systemPrompt}\n\n${section}`;
 }
@@ -129,6 +173,8 @@ function sendPortiaCommandError(pi: ExtensionAPI, error: unknown): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  let currentTrace: PheromoneTraceState | undefined;
+
   pi.registerMessageRenderer("portia", (message, _options, theme) => {
     const title = theme.fg("accent", theme.bold("Portia"));
     return new Text(`${title}\n${message.content}`, 0, 0);
@@ -142,6 +188,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     const settings = resolvePortiaSettings(ctx.cwd);
+    currentTrace = settings.enabled && shouldWritePheromones(settings)
+      ? createPheromoneTraceState(settings, event.prompt, ctx.sessionManager.getSessionFile())
+      : undefined;
     if (!settings.enabled) return;
 
     const sections: string[] = [];
@@ -152,8 +201,11 @@ export default function (pi: ExtensionAPI) {
       try {
         const db = openPortiaDatabase(settings.dbPath);
         try {
-          const context = buildAutopilotContext(db, settings, event.prompt, ctx.cwd);
-          if (context) sections.push(context);
+          const context = buildAutopilotContextResult(db, settings, event.prompt, ctx.cwd);
+          if (context) {
+            sections.push(context.rendered);
+            if (currentTrace) addSenseExposures(currentTrace, context.result, "autopilot");
+          }
         } finally {
           db.close();
         }
@@ -165,6 +217,62 @@ export default function (pi: ExtensionAPI) {
 
     if (sections.length === 0) return;
     return { systemPrompt: appendPromptSection(event.systemPrompt, sections.join("\n\n")) };
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (!currentTrace) return;
+    const settings = resolvePortiaSettings(ctx.cwd);
+    if (!shouldWritePheromones(settings)) return;
+
+    observeToolCall(currentTrace, {
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+    });
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    if (!currentTrace) return;
+    const settings = resolvePortiaSettings(ctx.cwd);
+    if (!shouldWritePheromones(settings)) return;
+
+    observeToolResult(currentTrace, settings, {
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+      input: event.input,
+      isError: event.isError,
+      cwd: ctx.cwd,
+    });
+  });
+
+  pi.on("turn_end", async (event, ctx) => {
+    if (!currentTrace) return;
+    const settings = resolvePortiaSettings(ctx.cwd);
+    if (!shouldWritePheromones(settings)) return;
+
+    for (const toolResult of event.toolResults) {
+      if (toolResult.toolName === "portia_sense" && isSenseResult(toolResult.details)) {
+        addSenseExposures(currentTrace, toolResult.details, "portia_sense");
+      }
+    }
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    if (!currentTrace) return;
+    const trace = currentTrace;
+    currentTrace = undefined;
+
+    try {
+      const settings = resolvePortiaSettings(ctx.cwd);
+      if (!shouldWritePheromones(settings)) return;
+      const db = openPortiaDatabase(settings.dbPath);
+      try {
+        flushPheromoneTraceState(db, settings, trace);
+      } finally {
+        db.close();
+      }
+    } catch {
+      // Pheromone tracing must never break the agent turn.
+    }
   });
 
   pi.registerCommand("portia-status", {
@@ -345,6 +453,43 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("portia-trails", {
+    description: "Browse Portia pheromone trails: /portia-trails [top|weak|recent|memory <id>] [limit]",
+    handler: async (args, ctx) => {
+      const settings = resolvePortiaSettings(ctx.cwd);
+      if (!settings.enabled) {
+        pi.sendMessage({
+          customType: "portia",
+          content: "Portia is disabled for this project/session.",
+          display: true,
+          details: { enabled: false, projectRoot: settings.projectRoot, modeOverride: settings.modeOverride },
+        });
+        return;
+      }
+
+      let input: PortiaTrailsInput;
+      try {
+        input = parseTrailsArgs(args);
+      } catch (error) {
+        sendPortiaCommandError(pi, error);
+        return;
+      }
+
+      const db = openPortiaDatabase(settings.dbPath);
+      try {
+        const result = listPortiaTrails(db, settings, input);
+        pi.sendMessage({
+          customType: "portia",
+          content: renderTrails(result),
+          display: true,
+          details: result,
+        });
+      } finally {
+        db.close();
+      }
+    },
+  });
+
   pi.registerCommand("portia-sense", {
     description: "Show Portia memories for a path: /portia-sense <path> [query]",
     handler: async (args, ctx) => {
@@ -363,6 +508,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const input = parseSenseArgs(args);
         const result = senseMemories(db, settings, input, ctx.cwd);
+        recordSenseExposureOnly(db, settings, result, "command");
         pi.sendMessage({
           customType: "portia",
           content: renderSense(result),

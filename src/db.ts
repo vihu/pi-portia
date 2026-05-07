@@ -8,16 +8,24 @@ import type {
   CreateMemoryInput,
   CreateMemoryResult,
   CreateMemorySupersedingInput,
+  ApplyPheromoneDeltaInput,
   CreateMemorySupersedingResult,
+  ListPheromonesFilters,
   MemoryEvent,
   MemoryListFilters,
+  MemoryPheromone,
+  MemoryPheromoneSummary,
   MemoryRecord,
+  MemoryTraceEvent,
   PortiaStats,
+  RecordTraceEventInput,
   UpdateMemoryStatusInput,
   UpdateMemoryStatusResult,
 } from "./types.ts";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const MIN_PHEROMONE_STRENGTH = -5;
+const MAX_PHEROMONE_STRENGTH = 20;
 
 interface MemoryRow {
   rowid: number;
@@ -44,6 +52,39 @@ interface EventRow {
   payload_json: string;
   created_at: string;
   created_by: string | null;
+}
+
+interface PheromoneRow {
+  memory_id: string;
+  strength: number;
+  exposed_count: number;
+  followed_count: number;
+  ignored_count: number;
+  success_count: number;
+  failure_count: number;
+  last_exposed_at: string | null;
+  last_followed_at: string | null;
+  last_ignored_at: string | null;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  last_decayed_at: string;
+  updated_at: string;
+}
+
+interface PheromoneSummaryRow extends PheromoneRow, MemoryRow {}
+
+interface TraceEventRow {
+  id: string;
+  memory_id: string;
+  event_type: string;
+  scope_path: string | null;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  session_file: string | null;
+  turn_id: string | null;
+  weight: number;
+  payload_json: string;
+  created_at: string;
 }
 
 interface CountRow {
@@ -93,6 +134,53 @@ function toEvent(row: EventRow): MemoryEvent {
     createdAt: row.created_at,
     createdBy: row.created_by ?? undefined,
   };
+}
+
+function toPheromone(row: PheromoneRow): MemoryPheromone {
+  return {
+    memoryId: row.memory_id,
+    strength: row.strength,
+    exposedCount: row.exposed_count,
+    followedCount: row.followed_count,
+    ignoredCount: row.ignored_count,
+    successCount: row.success_count,
+    failureCount: row.failure_count,
+    lastExposedAt: row.last_exposed_at ?? undefined,
+    lastFollowedAt: row.last_followed_at ?? undefined,
+    lastIgnoredAt: row.last_ignored_at ?? undefined,
+    lastSuccessAt: row.last_success_at ?? undefined,
+    lastFailureAt: row.last_failure_at ?? undefined,
+    lastDecayedAt: row.last_decayed_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toTraceEvent(row: TraceEventRow): MemoryTraceEvent {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    eventType: row.event_type,
+    scopePath: row.scope_path ?? undefined,
+    toolName: row.tool_name ?? undefined,
+    toolCallId: row.tool_call_id ?? undefined,
+    sessionFile: row.session_file ?? undefined,
+    turnId: row.turn_id ?? undefined,
+    weight: row.weight,
+    payloadJson: row.payload_json,
+    createdAt: row.created_at,
+  };
+}
+
+function clampPheromoneStrength(value: number): number {
+  return Math.max(MIN_PHEROMONE_STRENGTH, Math.min(MAX_PHEROMONE_STRENGTH, value));
+}
+
+function decayedStrength(strength: number, lastDecayedAt: string, now: string, halfLifeDays = 30): number {
+  const last = Date.parse(lastDecayedAt);
+  const current = Date.parse(now);
+  if (!Number.isFinite(last) || !Number.isFinite(current) || current <= last || halfLifeDays <= 0) return strength;
+  const ageDays = (current - last) / 86_400_000;
+  return strength * Math.pow(0.5, ageDays / halfLifeDays);
 }
 
 function escapeLike(value: string): string {
@@ -229,6 +317,44 @@ function runMigrations(db: DatabaseConnection): void {
       );
 
       create index if not exists memory_events_memory_idx on memory_events(memory_id, created_at);
+
+      create table if not exists memory_pheromones (
+        memory_id text primary key references memories(id),
+        strength real not null default 0,
+        exposed_count integer not null default 0,
+        followed_count integer not null default 0,
+        ignored_count integer not null default 0,
+        success_count integer not null default 0,
+        failure_count integer not null default 0,
+        last_exposed_at text,
+        last_followed_at text,
+        last_ignored_at text,
+        last_success_at text,
+        last_failure_at text,
+        last_decayed_at text not null,
+        updated_at text not null
+      );
+
+      create index if not exists memory_pheromones_strength_idx on memory_pheromones(strength, updated_at);
+      create index if not exists memory_pheromones_updated_idx on memory_pheromones(updated_at);
+
+      create table if not exists memory_trace_events (
+        id text primary key,
+        memory_id text not null references memories(id),
+        event_type text not null,
+        scope_path text,
+        tool_name text,
+        tool_call_id text,
+        session_file text,
+        turn_id text,
+        weight real not null default 0,
+        payload_json text not null,
+        created_at text not null
+      );
+
+      create index if not exists memory_trace_events_memory_idx on memory_trace_events(memory_id, created_at);
+      create index if not exists memory_trace_events_turn_idx on memory_trace_events(turn_id, created_at);
+      create index if not exists memory_trace_events_type_idx on memory_trace_events(event_type, created_at);
 
       create table if not exists memory_edges (
         from_id text not null,
@@ -597,6 +723,220 @@ export class PortiaDatabase {
     return rows.map(toMemory);
   }
 
+  recordTraceEvent(input: RecordTraceEventInput): MemoryTraceEvent {
+    const id = randomUUID();
+    const createdAt = input.createdAt ?? new Date().toISOString();
+    const payloadJson = JSON.stringify(input.payload ?? {});
+
+    this.db.prepare(`
+      insert into memory_trace_events (
+        id, memory_id, event_type, scope_path, tool_name, tool_call_id,
+        session_file, turn_id, weight, payload_json, created_at
+      ) values (
+        @id, @memoryId, @eventType, @scopePath, @toolName, @toolCallId,
+        @sessionFile, @turnId, @weight, @payloadJson, @createdAt
+      )
+    `).run({
+      id,
+      memoryId: input.memoryId,
+      eventType: input.eventType,
+      scopePath: input.scopePath ?? null,
+      toolName: input.toolName ?? null,
+      toolCallId: input.toolCallId ?? null,
+      sessionFile: input.sessionFile ?? null,
+      turnId: input.turnId ?? null,
+      weight: input.weight ?? 0,
+      payloadJson,
+      createdAt,
+    });
+
+    const row = this.db.prepare(`
+      select id, memory_id, event_type, scope_path, tool_name, tool_call_id,
+             session_file, turn_id, weight, payload_json, created_at
+      from memory_trace_events
+      where id = ?
+    `).get(id) as TraceEventRow | undefined;
+
+    if (!row) throw new Error(`Portia trace event was not found after write: ${id}`);
+    return toTraceEvent(row);
+  }
+
+  applyPheromoneDelta(input: ApplyPheromoneDeltaInput): MemoryPheromone {
+    const now = input.createdAt ?? new Date().toISOString();
+    const eventType = input.eventType;
+    const existing = this.getMemoryPheromone(input.memoryId);
+    const baseStrength = existing ? decayedStrength(existing.strength, existing.lastDecayedAt, now, input.halfLifeDays ?? 30) : 0;
+    const strength = clampPheromoneStrength(baseStrength + input.delta);
+
+    this.db.prepare(`
+      insert into memory_pheromones (
+        memory_id, strength, exposed_count, followed_count, ignored_count, success_count, failure_count,
+        last_exposed_at, last_followed_at, last_ignored_at, last_success_at, last_failure_at,
+        last_decayed_at, updated_at
+      ) values (
+        @memoryId, @strength,
+        case when @eventType = 'exposed' then 1 else 0 end,
+        case when @eventType in ('followed_scope', 'followed_source_ref') then 1 else 0 end,
+        case when @eventType = 'ignored' then 1 else 0 end,
+        case when @eventType = 'validation_passed' then 1 else 0 end,
+        case when @eventType = 'validation_failed' then 1 else 0 end,
+        case when @eventType = 'exposed' then @now else null end,
+        case when @eventType in ('followed_scope', 'followed_source_ref') then @now else null end,
+        case when @eventType = 'ignored' then @now else null end,
+        case when @eventType = 'validation_passed' then @now else null end,
+        case when @eventType = 'validation_failed' then @now else null end,
+        @now, @now
+      )
+      on conflict(memory_id) do update set
+        strength = @strength,
+        exposed_count = exposed_count + case when @eventType = 'exposed' then 1 else 0 end,
+        followed_count = followed_count + case when @eventType in ('followed_scope', 'followed_source_ref') then 1 else 0 end,
+        ignored_count = ignored_count + case when @eventType = 'ignored' then 1 else 0 end,
+        success_count = success_count + case when @eventType = 'validation_passed' then 1 else 0 end,
+        failure_count = failure_count + case when @eventType = 'validation_failed' then 1 else 0 end,
+        last_exposed_at = case when @eventType = 'exposed' then @now else last_exposed_at end,
+        last_followed_at = case when @eventType in ('followed_scope', 'followed_source_ref') then @now else last_followed_at end,
+        last_ignored_at = case when @eventType = 'ignored' then @now else last_ignored_at end,
+        last_success_at = case when @eventType = 'validation_passed' then @now else last_success_at end,
+        last_failure_at = case when @eventType = 'validation_failed' then @now else last_failure_at end,
+        last_decayed_at = @now,
+        updated_at = @now
+    `).run({
+      memoryId: input.memoryId,
+      eventType,
+      strength,
+      now,
+    });
+
+    const pheromone = this.getMemoryPheromone(input.memoryId);
+    if (!pheromone) throw new Error(`Portia pheromone summary was not found after write: ${input.memoryId}`);
+    return pheromone;
+  }
+
+  getMemoryPheromone(memoryId: string): MemoryPheromone | undefined {
+    const row = this.db.prepare(`
+      select memory_id, strength, exposed_count, followed_count, ignored_count, success_count, failure_count,
+             last_exposed_at, last_followed_at, last_ignored_at, last_success_at, last_failure_at,
+             last_decayed_at, updated_at
+      from memory_pheromones
+      where memory_id = ?
+    `).get(memoryId) as PheromoneRow | undefined;
+
+    return row ? toPheromone(row) : undefined;
+  }
+
+  getMemoryPheromones(memoryIds: string[]): Map<string, MemoryPheromone> {
+    const uniqueIds = [...new Set(memoryIds)];
+    if (uniqueIds.length === 0) return new Map();
+
+    const placeholders = uniqueIds.map(() => "?").join(", ");
+    const rows = this.db.prepare(`
+      select memory_id, strength, exposed_count, followed_count, ignored_count, success_count, failure_count,
+             last_exposed_at, last_followed_at, last_ignored_at, last_success_at, last_failure_at,
+             last_decayed_at, updated_at
+      from memory_pheromones
+      where memory_id in (${placeholders})
+    `).all(...uniqueIds) as PheromoneRow[];
+
+    return new Map(rows.map((row) => [row.memory_id, toPheromone(row)]));
+  }
+
+  listPheromones(filters: ListPheromonesFilters = {}): MemoryPheromoneSummary[] {
+    const limit = clampLimit(filters.limit, 20);
+    const mode = filters.mode ?? "top";
+    const where = mode === "weak"
+      ? "where p.exposed_count > 0 and p.followed_count = 0"
+      : "where p.exposed_count > 0 or p.followed_count > 0 or p.success_count > 0 or p.failure_count > 0 or p.strength != 0";
+    const order = mode === "weak"
+      ? "p.ignored_count desc, p.exposed_count desc, p.strength asc, p.updated_at desc"
+      : "p.strength desc, p.success_count desc, p.followed_count desc, p.updated_at desc";
+
+    const rows = this.db.prepare(`
+      select p.memory_id, p.strength, p.exposed_count, p.followed_count, p.ignored_count, p.success_count, p.failure_count,
+             p.last_exposed_at, p.last_followed_at, p.last_ignored_at, p.last_success_at, p.last_failure_at,
+             p.last_decayed_at, p.updated_at,
+             m.rowid, m.id, m.scope_path, m.kind, m.title, m.body, m.status, m.importance, m.confidence,
+             m.created_at, m.updated_at as memory_updated_at, m.created_by, m.supersedes_id, m.source_type, m.source_ref
+      from memory_pheromones p
+      left join memories m on m.id = p.memory_id
+      ${where}
+      order by ${order}
+      limit @limit
+    `).all({ limit }) as Array<PheromoneRow & {
+      rowid: number | null;
+      id: string | null;
+      scope_path: string | null;
+      kind: string | null;
+      title: string | null;
+      body: string | null;
+      status: string | null;
+      importance: number | null;
+      confidence: number | null;
+      created_at: string | null;
+      memory_updated_at: string | null;
+      created_by: string | null;
+      supersedes_id: string | null;
+      source_type: string | null;
+      source_ref: string | null;
+    }>;
+
+    return rows.map((row) => {
+      const summary: MemoryPheromoneSummary = toPheromone(row);
+      if (row.id) {
+        summary.memory = toMemory({
+          rowid: row.rowid ?? 0,
+          id: row.id,
+          scope_path: row.scope_path ?? ".",
+          kind: row.kind ?? "pointer",
+          title: row.title,
+          body: row.body ?? "",
+          status: row.status ?? "deleted",
+          importance: row.importance ?? 0,
+          confidence: row.confidence ?? 100,
+          created_at: row.created_at ?? row.updated_at,
+          updated_at: row.memory_updated_at ?? row.updated_at,
+          created_by: row.created_by,
+          supersedes_id: row.supersedes_id,
+          source_type: row.source_type,
+          source_ref: row.source_ref,
+        });
+      }
+      return summary;
+    });
+  }
+
+  getTraceEventsForMemory(memoryId: string, limit = 20): MemoryTraceEvent[] {
+    const rows = this.db.prepare(`
+      select id, memory_id, event_type, scope_path, tool_name, tool_call_id,
+             session_file, turn_id, weight, payload_json, created_at
+      from memory_trace_events
+      where memory_id = @memoryId
+      order by created_at desc, id desc
+      limit @limit
+    `).all({ memoryId, limit: clampLimit(limit, 20) }) as TraceEventRow[];
+
+    return rows.map(toTraceEvent);
+  }
+
+  getRecentTraceEvents(limit = 20): MemoryTraceEvent[] {
+    const rows = this.db.prepare(`
+      select id, memory_id, event_type, scope_path, tool_name, tool_call_id,
+             session_file, turn_id, weight, payload_json, created_at
+      from memory_trace_events
+      order by created_at desc, id desc
+      limit @limit
+    `).all({ limit: clampLimit(limit, 20) }) as TraceEventRow[];
+
+    return rows.map(toTraceEvent);
+  }
+
+  pruneTraceEvents(retentionDays: number, now = new Date()): number {
+    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0;
+    const cutoff = new Date(now.getTime() - retentionDays * 86_400_000).toISOString();
+    const result = this.db.prepare("delete from memory_trace_events where created_at < ?").run(cutoff) as { changes?: number };
+    return result.changes ?? 0;
+  }
+
   getStats(): PortiaStats {
     const count = (sql: string): number => (this.db.prepare(sql).get() as CountRow | undefined)?.count ?? 0;
     const schemaVersion = Number(
@@ -633,6 +973,9 @@ export class PortiaDatabase {
       supersededMemories: count("select count(*) as count from memories where status = 'superseded'"),
       deletedMemories: count("select count(*) as count from memories where status = 'deleted'"),
       ftsAvailable,
+      pheromoneTraceEvents: count("select count(*) as count from memory_trace_events"),
+      pheromoneMemoryCount: count("select count(*) as count from memory_pheromones"),
+      reinforcedMemories: count("select count(*) as count from memory_pheromones where strength > 0"),
       byKind,
       topScopes,
     };

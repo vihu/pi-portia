@@ -1,13 +1,18 @@
 import * as path from "node:path";
+import { computeEffectivePheromoneStrength, computePheromoneBoost } from "./pheromones.ts";
 import type {
   MemoryEvent,
+  MemoryPheromone,
+  MemoryPheromoneSummary,
   MemoryRecord,
+  MemoryTraceEvent,
   PortiaInspectResult,
   PortiaListResult,
   PortiaRecordResult,
   PortiaRepairResult,
   PortiaSettings,
   PortiaStats,
+  PortiaTrailsResult,
   RetrievedMemory,
   RetrievalSignal,
   SenseResult,
@@ -25,7 +30,7 @@ function formatMaybeRelative(projectRoot: string, absolutePath: string): string 
 
 function renderSignal(signal: RetrievalSignal): string {
   const label = signal.type.toUpperCase();
-  const target = signal.scopePath ?? signal.query ?? "query";
+  const target = signal.scopePath ?? signal.query ?? (signal.type === "pheromone" ? "reinforced" : "query");
   const parts = [`- ${label} ${target}`];
   if (signal.strength !== undefined) parts.push(`strength=${signal.strength}`);
   if (signal.score !== undefined) parts.push(`score=${signal.score.toFixed(3)}`);
@@ -43,10 +48,12 @@ function renderMemory(memory: RetrievedMemory): string {
 
   if (memory.importance) headerParts.push(`importance=${memory.importance}`);
   if (memory.confidence !== 100) headerParts.push(`confidence=${memory.confidence}`);
+  if (memory.pheromoneBoost && memory.pheromoneBoost > 0) headerParts.push(`pheromone=+${memory.pheromoneBoost.toFixed(1)}`);
 
   const reasonText = memory.reasons
     .map((reason) => {
       if (reason.type === "chord") return "chord";
+      if (reason.type === "pheromone") return `pheromone:+${(memory.pheromoneBoost ?? reason.strength ?? 0).toFixed(1)}`;
       return `${reason.type}:${reason.scopePath ?? "?"}`;
     })
     .join(", ");
@@ -137,6 +144,41 @@ function renderEvent(event: MemoryEvent): string {
   return `- ${event.eventType} ${event.createdAt}${by}\n${renderEventPayload(event)}`;
 }
 
+function renderTraceEvent(event: MemoryTraceEvent): string {
+  const parts = [`- ${event.eventType}`, event.createdAt, `[${event.memoryId}]`, `weight=${event.weight}`];
+  if (event.scopePath) parts.push(`scope=${event.scopePath}`);
+  if (event.toolName) parts.push(`tool=${event.toolName}`);
+  if (event.toolCallId) parts.push(`call=${event.toolCallId}`);
+  return parts.join(" ");
+}
+
+function renderPheromoneSummary(summary: MemoryPheromoneSummary): string {
+  const memory = summary.memory;
+  const title = memory?.title ? truncate(memory.title, 90) : memory ? truncate(memory.body.replace(/\s+/g, " ").trim(), 90) : "missing memory";
+  const scope = memory ? `${memory.status} ${memory.kind} ${memory.scopePath}` : "missing";
+  const effective = summary.effectiveStrength !== undefined ? ` effective=${summary.effectiveStrength.toFixed(2)}` : "";
+  const boost = summary.boost !== undefined ? ` boost=+${summary.boost.toFixed(1)}` : "";
+  return `- [${summary.memoryId}] strength=${summary.strength.toFixed(2)}${effective}${boost} exposed=${summary.exposedCount} followed=${summary.followedCount} success=${summary.successCount} failure=${summary.failureCount} ${scope} — ${title}`;
+}
+
+function renderPheromoneBlock(pheromone: MemoryPheromone | undefined, effectiveStrength?: number, pheromoneBoost?: number): string[] {
+  if (!pheromone) return ["No pheromone summary recorded yet."];
+  const effective = effectiveStrength ?? computeEffectivePheromoneStrength(pheromone, 30);
+  const boost = pheromoneBoost ?? computePheromoneBoost(effective, 25);
+  const lines: string[] = [];
+  lines.push(`Strength: ${pheromone.strength.toFixed(2)} effective=${effective.toFixed(2)} boost=+${boost.toFixed(1)}`);
+  lines.push(`Exposed: ${pheromone.exposedCount}`);
+  lines.push(`Followed: ${pheromone.followedCount}`);
+  lines.push(`Ignored: ${pheromone.ignoredCount}`);
+  lines.push(`Validation passed: ${pheromone.successCount}`);
+  lines.push(`Validation failed: ${pheromone.failureCount}`);
+  if (pheromone.lastExposedAt) lines.push(`Last exposed: ${pheromone.lastExposedAt}`);
+  if (pheromone.lastFollowedAt) lines.push(`Last followed: ${pheromone.lastFollowedAt}`);
+  if (pheromone.lastSuccessAt) lines.push(`Last success: ${pheromone.lastSuccessAt}`);
+  if (pheromone.lastFailureAt) lines.push(`Last failure: ${pheromone.lastFailureAt}`);
+  return lines;
+}
+
 export function renderMemoryList(result: PortiaListResult): string {
   const lines: string[] = [];
   lines.push("# Portia List");
@@ -201,6 +243,10 @@ export function renderMemoryInspect(result: PortiaInspectResult): string {
   lines.push("");
   lines.push("Body:");
   lines.push(memory.body);
+
+  lines.push("");
+  lines.push("## Pheromone");
+  for (const line of renderPheromoneBlock(result.pheromone, result.pheromoneEffectiveStrength, result.pheromoneBoost)) lines.push(line);
 
   lines.push("");
   lines.push(`## Events (${result.events.length})`);
@@ -284,6 +330,41 @@ export function renderAutopilotContext(result: SenseResult, maxChars: number): s
 
   if (lines.length <= 4) return undefined;
   return truncate(lines.join("\n"), maxChars);
+}
+
+export function renderTrails(result: PortiaTrailsResult): string {
+  const lines: string[] = [];
+  lines.push("# Portia Trails");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Mode: ${result.mode}`);
+  if (result.memoryId) lines.push(`Memory: ${result.memoryId}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  if (result.pheromones.length > 0) {
+    lines.push("");
+    lines.push(`## Pheromones (${result.pheromones.length})`);
+    for (const pheromone of result.pheromones) lines.push(renderPheromoneSummary(pheromone));
+  }
+
+  if (result.events.length > 0) {
+    lines.push("");
+    lines.push(`## Trace Events (${result.events.length})`);
+    for (const event of result.events) lines.push(renderTraceEvent(event));
+  }
+
+  if (result.pheromones.length === 0 && result.events.length === 0) {
+    lines.push("");
+    lines.push("No Portia pheromone trails matched these filters yet.");
+  }
+
+  return lines.join("\n");
 }
 
 export function renderRecord(result: PortiaRecordResult): string {
@@ -372,6 +453,12 @@ export function renderStatus(settings: PortiaSettings, stats: PortiaStats): stri
   lines.push(`Autopilot guidance: ${settings.autoPromptGuidance}`);
   lines.push(`Autopilot record guidance: ${settings.autoRecordGuidance}`);
   lines.push(`Autopilot sense: ${settings.autoSense ? `enabled (${settings.autoSenseMaxResults} memories, ${settings.autoSenseMaxChars} chars)` : "disabled"}`);
+  lines.push(`Pheromones: ${settings.enablePheromones ? "enabled" : "disabled"}, ranking ${settings.pheromoneRanking ? "on" : "off"}`);
+  lines.push(`Pheromone worker policy: ${settings.pheromoneWorkerPolicy}`);
+  lines.push(`Pheromone half-life: ${settings.pheromoneHalfLifeDays} days`);
+  lines.push(`Pheromone max boost: ${settings.pheromoneMaxBoost}`);
+  lines.push(`Trace events: ${stats.pheromoneTraceEvents}`);
+  lines.push(`Reinforced memories: ${stats.reinforcedMemories}`);
   lines.push("");
   lines.push("## Memory Counts");
   lines.push(`- total: ${stats.totalMemories}`);

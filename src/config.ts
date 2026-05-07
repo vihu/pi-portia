@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { findProjectRoot } from "./root.ts";
-import type { PortiaMode, PortiaSettings, WritePolicy } from "./types.ts";
+import type { PheromoneWorkerPolicy, PortiaMode, PortiaSettings, WritePolicy } from "./types.ts";
 
 const SETTINGS_KEY = "portia";
 const DEFAULT_DB_PATH = ".pi/portia/portia.sqlite";
@@ -22,6 +22,16 @@ interface PartialPortiaSettings {
   autoSense?: boolean;
   autoSenseMaxResults?: number;
   autoSenseMaxChars?: number;
+  enablePheromones?: boolean;
+  pheromoneRanking?: boolean;
+  pheromoneHalfLifeDays?: number;
+  pheromoneMaxBoost?: number;
+  pheromoneFollowWeight?: number;
+  pheromoneSuccessWeight?: number;
+  pheromoneFailureWeight?: number;
+  pheromoneIgnoredWeight?: number;
+  pheromoneWorkerPolicy?: PheromoneWorkerPolicy;
+  traceRetentionDays?: number;
 }
 
 function readJsonSafe(filePath: string): Record<string, unknown> {
@@ -41,6 +51,17 @@ function parsePositiveInteger(value: unknown): number | undefined {
   return value;
 }
 
+function parseFiniteNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value;
+}
+
+function parsePositiveNumber(value: unknown): number | undefined {
+  const parsed = parseFiniteNumber(value);
+  if (parsed === undefined || parsed <= 0) return undefined;
+  return parsed;
+}
+
 function parseWritePolicy(value: unknown): WritePolicy | undefined {
   if (value === "readonly" || value === "confirm" || value === "write") return value;
   return undefined;
@@ -49,6 +70,11 @@ function parseWritePolicy(value: unknown): WritePolicy | undefined {
 function parseMode(value: unknown): PortiaMode | undefined {
   if (value === "off") return value;
   return parseWritePolicy(value);
+}
+
+function parsePheromoneWorkerPolicy(value: unknown): PheromoneWorkerPolicy | undefined {
+  if (value === "off" || value === "low" || value === "write") return value;
+  return undefined;
 }
 
 function parseSettingsFile(filePath: string): PartialPortiaSettings {
@@ -98,6 +124,36 @@ function parseSettingsFile(filePath: string): PartialPortiaSettings {
   const autoSenseMaxChars = parsePositiveInteger(input.autoSenseMaxChars);
   if (autoSenseMaxChars) settings.autoSenseMaxChars = Math.min(autoSenseMaxChars, 12_000);
 
+  const enablePheromones = parseBoolean(input.enablePheromones);
+  if (enablePheromones !== undefined) settings.enablePheromones = enablePheromones;
+
+  const pheromoneRanking = parseBoolean(input.pheromoneRanking);
+  if (pheromoneRanking !== undefined) settings.pheromoneRanking = pheromoneRanking;
+
+  const pheromoneHalfLifeDays = parsePositiveNumber(input.pheromoneHalfLifeDays);
+  if (pheromoneHalfLifeDays !== undefined) settings.pheromoneHalfLifeDays = Math.min(pheromoneHalfLifeDays, 3650);
+
+  const pheromoneMaxBoost = parsePositiveNumber(input.pheromoneMaxBoost);
+  if (pheromoneMaxBoost !== undefined) settings.pheromoneMaxBoost = Math.min(pheromoneMaxBoost, 100);
+
+  const pheromoneFollowWeight = parseFiniteNumber(input.pheromoneFollowWeight);
+  if (pheromoneFollowWeight !== undefined) settings.pheromoneFollowWeight = Math.max(-10, Math.min(10, pheromoneFollowWeight));
+
+  const pheromoneSuccessWeight = parseFiniteNumber(input.pheromoneSuccessWeight);
+  if (pheromoneSuccessWeight !== undefined) settings.pheromoneSuccessWeight = Math.max(-10, Math.min(10, pheromoneSuccessWeight));
+
+  const pheromoneFailureWeight = parseFiniteNumber(input.pheromoneFailureWeight);
+  if (pheromoneFailureWeight !== undefined) settings.pheromoneFailureWeight = Math.max(-10, Math.min(10, pheromoneFailureWeight));
+
+  const pheromoneIgnoredWeight = parseFiniteNumber(input.pheromoneIgnoredWeight);
+  if (pheromoneIgnoredWeight !== undefined) settings.pheromoneIgnoredWeight = Math.max(-10, Math.min(10, pheromoneIgnoredWeight));
+
+  const pheromoneWorkerPolicy = parsePheromoneWorkerPolicy(input.pheromoneWorkerPolicy);
+  if (pheromoneWorkerPolicy) settings.pheromoneWorkerPolicy = pheromoneWorkerPolicy;
+
+  const traceRetentionDays = parsePositiveInteger(input.traceRetentionDays);
+  if (traceRetentionDays) settings.traceRetentionDays = Math.min(traceRetentionDays, 3650);
+
   return settings;
 }
 
@@ -129,6 +185,16 @@ export function resolvePortiaSettings(cwd: string): PortiaSettings {
     autoSense: true,
     autoSenseMaxResults: 5,
     autoSenseMaxChars: 2_500,
+    enablePheromones: true,
+    pheromoneRanking: true,
+    pheromoneHalfLifeDays: 30,
+    pheromoneMaxBoost: 25,
+    pheromoneFollowWeight: 1,
+    pheromoneSuccessWeight: 2,
+    pheromoneFailureWeight: -0.4,
+    pheromoneIgnoredWeight: 0,
+    pheromoneWorkerPolicy: "off" as PheromoneWorkerPolicy,
+    traceRetentionDays: 180,
     ...globalSettings,
     ...projectSettings,
   };
