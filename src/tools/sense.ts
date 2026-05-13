@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { resolvePortiaSettings } from "../config.ts";
 import { openPortiaDatabase } from "../db.ts";
 import { renderSense } from "../render.ts";

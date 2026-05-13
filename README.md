@@ -36,7 +36,13 @@ Not implemented yet:
 
 ## Installation
 
-Install from GitHub with Pi:
+Install from npm with Pi:
+
+```bash
+pi install npm:pi-portia
+```
+
+Alternatively, install directly from GitHub:
 
 ```bash
 pi install git:github.com/vihu/pi-portia
