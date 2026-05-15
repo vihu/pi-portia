@@ -8,15 +8,17 @@ import { listPortiaMemories } from "./list.ts";
 import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, recordSenseExposureOnly, shouldWritePheromones } from "./pheromones.ts";
 import type { PheromoneTraceState } from "./pheromones.ts";
 import { repairPortiaMemory } from "./repair.ts";
-import { renderMemoryInspect, renderMemoryList, renderRepair, renderSense, renderStatus, renderTrails } from "./render.ts";
+import { renderMemoryInspect, renderMemoryList, renderRepair, renderSearch, renderSense, renderStatus, renderTrails } from "./render.ts";
 import { senseMemories } from "./retrieval.ts";
+import { parsePortiaSearchCommandArgs, searchPortiaMemories } from "./search.ts";
 import { listPortiaTrails } from "./trails.ts";
 import { registerPortiaInspectTool } from "./tools/inspect.ts";
 import { registerPortiaListTool } from "./tools/list.ts";
 import { registerPortiaRecordTool } from "./tools/record.ts";
 import { registerPortiaRepairTool } from "./tools/repair.ts";
+import { registerPortiaSearchTool } from "./tools/search.ts";
 import { registerPortiaSenseTool } from "./tools/sense.ts";
-import type { MemoryListStatus, PortiaRepairAction, PortiaTrailsInput, SenseResult } from "./types.ts";
+import type { MemoryListStatus, PortiaRepairAction, PortiaSearchInput, PortiaTrailsInput, SenseResult } from "./types.ts";
 import type { PortiaListInput } from "./list.ts";
 
 function parseSenseArgs(args: string): { path: string; query?: string } {
@@ -183,6 +185,7 @@ export default function (pi: ExtensionAPI) {
   registerPortiaSenseTool(pi);
   registerPortiaRecordTool(pi);
   registerPortiaListTool(pi);
+  registerPortiaSearchTool(pi);
   registerPortiaInspectTool(pi);
   registerPortiaRepairTool(pi);
 
@@ -333,6 +336,43 @@ export default function (pi: ExtensionAPI) {
         pi.sendMessage({
           customType: "portia",
           content: renderMemoryList(result),
+          display: true,
+          details: result,
+        });
+      } finally {
+        db.close();
+      }
+    },
+  });
+
+  pi.registerCommand("portia-search", {
+    description: "Search Portia memories: /portia-search [status] [scope <path>] [kind <kind>] [limit <n>] [query] <text>; continue with cursor <cursor> plus the same query/filters.",
+    handler: async (args, ctx) => {
+      const settings = resolvePortiaSettings(ctx.cwd);
+      if (!settings.enabled) {
+        pi.sendMessage({
+          customType: "portia",
+          content: "Portia is disabled for this project/session.",
+          display: true,
+          details: { enabled: false, projectRoot: settings.projectRoot, modeOverride: settings.modeOverride },
+        });
+        return;
+      }
+
+      let input: PortiaSearchInput;
+      try {
+        input = parsePortiaSearchCommandArgs(args);
+      } catch (error) {
+        sendPortiaCommandError(pi, error);
+        return;
+      }
+
+      const db = openPortiaDatabase(settings.dbPath);
+      try {
+        const result = searchPortiaMemories(db, settings, input, ctx.cwd);
+        pi.sendMessage({
+          customType: "portia",
+          content: renderSearch(result),
           display: true,
           details: result,
         });

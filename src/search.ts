@@ -1,16 +1,32 @@
 import { createHash } from "node:crypto";
+import * as path from "node:path";
+import type { PortiaDatabase } from "./db.ts";
+import { isPathInside, normalizeScopePath, toProjectRelative } from "./root.ts";
+import { MEMORY_KINDS, MEMORY_STATUSES } from "./types.ts";
 import type {
+  MemoryKind,
   MemoryListStatus,
   MemorySearchFilters,
+  PortiaSearchInput,
   PortiaSearchMatchMode,
   PortiaSearchMatchType,
   PortiaSearchOrderBy,
+  PortiaSearchOutput,
   PortiaSearchScopeMode,
+  PortiaSettings,
 } from "./types.ts";
 
 export const MAX_SEARCH_QUERY_LENGTH = 500;
 export const MAX_SEARCH_TERMS_LENGTH = 2_000;
 export const SEARCH_CURSOR_TYPE = "portia_search";
+
+const DEFAULT_SEARCH_LIMIT = 30;
+const DEFAULT_SEARCH_MAX_RESULTS = 250;
+const MAX_CURSOR_LENGTH = 4_000;
+const SEARCH_STATUSES = new Set<string>([...MEMORY_STATUSES, "all", "any"]);
+const SEARCH_SCOPE_MODES = new Set<string>(["subtree", "exact"]);
+const SEARCH_ORDER_BYS = new Set<string>(["relevance", "updated", "importance"]);
+const SEARCH_MATCH_MODES = new Set<string>(["all", "any", "phrase"]);
 
 export type SafeFtsQueryIssue = "empty" | "too_long";
 
@@ -71,6 +87,93 @@ interface SearchCursorFingerprintInput {
   orderBy?: PortiaSearchOrderBy;
   matchMode?: PortiaSearchMatchMode;
   includeSubstringFallback?: boolean;
+}
+
+function stripAtPrefix(input: string): string {
+  return input.startsWith("@") ? input.slice(1) : input;
+}
+
+function parseSearchStatus(value: string | undefined): MemoryListStatus {
+  if (!value) return "active";
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "all" || normalized === "any") return "any";
+  if ((MEMORY_STATUSES as readonly string[]).includes(normalized)) return normalized as MemoryListStatus;
+  throw new Error(`Invalid Portia search status: ${value}`);
+}
+
+function parseSearchKind(value: string | undefined): MemoryKind | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if ((MEMORY_KINDS as readonly string[]).includes(normalized)) return normalized as MemoryKind;
+  throw new Error(`Invalid Portia memory kind: ${value}`);
+}
+
+function parseSearchScopeMode(value: string | undefined): PortiaSearchScopeMode {
+  if (!value) return "subtree";
+  const normalized = value.trim().toLowerCase();
+  if (SEARCH_SCOPE_MODES.has(normalized)) return normalized as PortiaSearchScopeMode;
+  throw new Error(`Invalid Portia search scopeMode: ${value}`);
+}
+
+function parseSearchOrderBy(value: string | undefined): PortiaSearchOrderBy {
+  if (!value) return "relevance";
+  const normalized = value.trim().toLowerCase();
+  if (SEARCH_ORDER_BYS.has(normalized)) return normalized as PortiaSearchOrderBy;
+  throw new Error(`Invalid Portia search orderBy: ${value}`);
+}
+
+function parseSearchMatchMode(value: string | undefined): PortiaSearchMatchMode {
+  if (!value) return "all";
+  const normalized = value.trim().toLowerCase();
+  if (SEARCH_MATCH_MODES.has(normalized)) return normalized as PortiaSearchMatchMode;
+  throw new Error(`Invalid Portia search matchMode: ${value}`);
+}
+
+function parseSearchLimit(settings: PortiaSettings, value: number | undefined, warnings: string[]): number {
+  const defaultLimit = settings.searchDefaultLimit ?? DEFAULT_SEARCH_LIMIT;
+  const maxResults = settings.searchMaxResults ?? DEFAULT_SEARCH_MAX_RESULTS;
+  if (value === undefined) return defaultLimit;
+  if (!Number.isInteger(value) || value <= 0) throw new Error("Portia search limit must be a positive integer.");
+  if (value > maxResults) {
+    warnings.push(`Requested limit ${value} exceeds portia.searchMaxResults ${maxResults}; using ${maxResults}.`);
+    return maxResults;
+  }
+  return value;
+}
+
+function trimOptional(value: string | undefined, maxLength: number, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > maxLength) throw new Error(`${label} is too long; maximum is ${maxLength} characters.`);
+  return trimmed;
+}
+
+function resolveSearchScopePath(settings: PortiaSettings, cwd: string, inputScopePath: string): string {
+  const raw = stripAtPrefix(inputScopePath.trim() || ".");
+  const absolutePath = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : path.resolve(cwd, raw);
+
+  if (!isPathInside(settings.projectRoot, absolutePath)) {
+    throw new Error(`Scope path is outside the Portia project root: ${inputScopePath}`);
+  }
+
+  return normalizeScopePath(toProjectRelative(settings.projectRoot, absolutePath));
+}
+
+function parseCommandBoolean(value: string | undefined, label: string): boolean {
+  if (value === undefined) return true;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "yes", "on", "1"].includes(normalized)) return true;
+  if (["false", "no", "off", "0"].includes(normalized)) return false;
+  throw new Error(`Usage: /portia-search ${label} <true|false>`);
+}
+
+function requireNextToken(tokens: string[], index: number, usage: string): string {
+  const value = tokens[index + 1];
+  if (!value) throw new Error(usage);
+  return value;
 }
 
 function pushTerm(terms: string[], term: string): void {
@@ -285,5 +388,160 @@ export function buildSafeFtsQuery(input: string, options: BuildSafeFtsQueryOptio
       matchMode,
     },
     warnings: [],
+  };
+}
+
+export function parsePortiaSearchCommandArgs(args: string): PortiaSearchInput {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  const input: Partial<PortiaSearchInput> = {};
+  let index = 0;
+
+  if (tokens[index] && SEARCH_STATUSES.has(tokens[index].toLowerCase())) {
+    input.status = parseSearchStatus(tokens[index].toLowerCase());
+    index += 1;
+  }
+
+  while (index < tokens.length) {
+    const token = tokens[index].toLowerCase();
+
+    if (token === "query") {
+      input.query = tokens.slice(index + 1).join(" ").trim();
+      break;
+    }
+
+    if (token === "status") {
+      input.status = parseSearchStatus(requireNextToken(tokens, index, "Usage: /portia-search status <active|stale|superseded|deleted|any>"));
+      index += 2;
+      continue;
+    }
+
+    if (SEARCH_STATUSES.has(token)) {
+      input.status = parseSearchStatus(token);
+      index += 1;
+      continue;
+    }
+
+    if (token === "scope") {
+      input.scopePath = requireNextToken(tokens, index, "Usage: /portia-search scope <path>");
+      index += 2;
+      continue;
+    }
+
+    if (token === "scope-mode" || token === "scopemode") {
+      input.scopeMode = parseSearchScopeMode(requireNextToken(tokens, index, "Usage: /portia-search scope-mode <subtree|exact>"));
+      index += 2;
+      continue;
+    }
+
+    if (token === "kind") {
+      input.kind = requireNextToken(tokens, index, "Usage: /portia-search kind <kind>");
+      index += 2;
+      continue;
+    }
+
+    if (token === "order" || token === "orderby" || token === "sort") {
+      input.orderBy = parseSearchOrderBy(requireNextToken(tokens, index, "Usage: /portia-search order <relevance|updated|importance>"));
+      index += 2;
+      continue;
+    }
+
+    if (token === "match" || token === "matchmode" || token === "mode") {
+      input.matchMode = parseSearchMatchMode(requireNextToken(tokens, index, "Usage: /portia-search match <all|any|phrase>"));
+      index += 2;
+      continue;
+    }
+
+    if (token === "limit") {
+      const value = Number(requireNextToken(tokens, index, "Usage: /portia-search limit <positive integer>"));
+      if (!Number.isInteger(value)) throw new Error("Usage: /portia-search limit <positive integer>");
+      input.limit = value;
+      index += 2;
+      continue;
+    }
+
+    if (token === "cursor") {
+      input.cursor = requireNextToken(tokens, index, "Usage: /portia-search cursor <cursor> query <text>");
+      index += 2;
+      continue;
+    }
+
+    if (token === "fallback" || token === "substring-fallback") {
+      const next = tokens[index + 1];
+      const hasExplicitValue = next !== undefined && /^(true|false|yes|no|on|off|1|0)$/i.test(next);
+      input.includeSubstringFallback = parseCommandBoolean(hasExplicitValue ? next : undefined, token);
+      index += hasExplicitValue ? 2 : 1;
+      continue;
+    }
+
+    if (token === "no-fallback" || token === "no-substring-fallback") {
+      input.includeSubstringFallback = false;
+      index += 1;
+      continue;
+    }
+
+    input.query = tokens.slice(index).join(" ").trim();
+    break;
+  }
+
+  if (!input.query?.trim()) {
+    if (input.cursor) throw new Error("Usage: /portia-search cursor <cursor> query <text> (repeat the same query and filters used for the previous page)");
+    throw new Error("Usage: /portia-search [status] [scope <path>] [kind <kind>] [limit <n>] [query] <text>");
+  }
+
+  return input as PortiaSearchInput;
+}
+
+export function searchPortiaMemories(db: PortiaDatabase, settings: PortiaSettings, input: PortiaSearchInput, cwd: string): PortiaSearchOutput {
+  if (!settings.enabled) throw new Error("Portia is disabled for this project/session.");
+
+  const warnings: string[] = [];
+  const query = typeof input.query === "string" ? input.query.trim() : "";
+  const status = parseSearchStatus(input.status);
+  const kind = parseSearchKind(input.kind);
+  const scopePath = input.scopePath ? resolveSearchScopePath(settings, cwd, input.scopePath) : undefined;
+  const scopeMode = parseSearchScopeMode(input.scopeMode);
+  const orderBy = parseSearchOrderBy(input.orderBy);
+  const matchMode = parseSearchMatchMode(input.matchMode);
+  const includeSubstringFallback = input.includeSubstringFallback ?? true;
+  const limit = parseSearchLimit(settings, input.limit, warnings);
+  const cursor = trimOptional(input.cursor, MAX_CURSOR_LENGTH, "Portia search cursor");
+  const built = buildSafeFtsQuery(query, { matchMode });
+
+  if (!built.ok) throw new Error(built.error.message);
+  warnings.push(...built.warnings);
+
+  const result = db.searchMemoryPage({
+    ftsQuery: built.query.expression,
+    rawQuery: built.query.rawQuery,
+    terms: built.query.terms,
+    status,
+    scopePath,
+    scopeMode,
+    kind,
+    orderBy,
+    matchMode,
+    includeSubstringFallback,
+    limit,
+    cursor,
+  });
+
+  return {
+    projectRoot: settings.projectRoot,
+    dbPath: settings.dbPath,
+    filters: {
+      query: built.query.rawQuery,
+      status,
+      scopePath,
+      scopeMode,
+      kind,
+      orderBy,
+      matchMode,
+      includeSubstringFallback,
+      limit: result.page.limit,
+      cursor,
+    },
+    hits: result.hits,
+    page: result.page,
+    warnings,
   };
 }

@@ -13,7 +13,7 @@ import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState,
 import { recordPortiaMemory } from "../src/record.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
 import { senseMemories } from "../src/retrieval.ts";
-import { buildSafeFtsQuery, buildSearchTerms, parsePlainSearchTerms } from "../src/search.ts";
+import { buildSafeFtsQuery, buildSearchTerms, parsePlainSearchTerms, parsePortiaSearchCommandArgs, searchPortiaMemories } from "../src/search.ts";
 import { listPortiaTrails } from "../src/trails.ts";
 
 function tempProject() {
@@ -65,6 +65,10 @@ function settings(projectRoot, dbPath, overrides = {}) {
     workerWritePolicy: "readonly",
     effectiveWritePolicy: overrides.effectiveWritePolicy ?? writePolicy,
     maxSenseResults: 12,
+    searchDefaultLimit: 30,
+    searchMaxResults: 250,
+    listDefaultLimit: 30,
+    listMaxResults: 250,
     enableDependencyScan: true,
     enableFts: true,
     enableVectors: false,
@@ -513,6 +517,77 @@ test("searchMemoryPage does not duplicate FTS hits as substring fallback", () =>
     db.close();
     fs.rmSync(project, { recursive: true, force: true });
   }
+});
+
+test("searchPortiaMemories applies safe query defaults, filters, and limit settings", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    db.createMemory({
+      scopePath: "src/config",
+      kind: "decision",
+      title: "Search limits decision",
+      body: "The searchDefaultLimit setting controls default result size.",
+      importance: 8,
+      confidence: 100,
+    });
+    db.createMemory({
+      scopePath: "docs/config",
+      kind: "gotcha",
+      title: "Search limits gotcha",
+      body: "Use maxSenseResults for sense, not for explicit search.",
+      importance: 4,
+      confidence: 100,
+    });
+
+    const result = searchPortiaMemories(db, settings(project, dbPath, {
+      searchDefaultLimit: 1,
+      searchMaxResults: 2,
+    }), {
+      query: "searchDefaultLimit",
+      kind: "decision",
+      scopePath: "src",
+      limit: 5,
+    }, project);
+
+    assert.equal(result.filters.query, "searchDefaultLimit");
+    assert.equal(result.filters.status, "active");
+    assert.equal(result.filters.scopePath, "src");
+    assert.equal(result.filters.scopeMode, "subtree");
+    assert.equal(result.filters.kind, "decision");
+    assert.equal(result.filters.orderBy, "relevance");
+    assert.equal(result.filters.matchMode, "all");
+    assert.equal(result.filters.limit, 2);
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0].memory.kind, "decision");
+    assert.match(result.warnings.join("\n"), /searchMaxResults 2/);
+
+    assert.throws(() => searchPortiaMemories(db, settings(project, dbPath), { query: "   " }, project), /Search query is empty/);
+    assert.throws(() => searchPortiaMemories(db, settings(project, dbPath), { query: "limits", scopePath: ".." }, project), /outside the Portia project root/);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("parsePortiaSearchCommandArgs supports human search syntax", () => {
+  assert.deepEqual(parsePortiaSearchCommandArgs("kind decision scope src limit 50 match any order updated query max sense results"), {
+    kind: "decision",
+    scopePath: "src",
+    limit: 50,
+    matchMode: "any",
+    orderBy: "updated",
+    query: "max sense results",
+  });
+  assert.deepEqual(parsePortiaSearchCommandArgs("all cursor abc123 no-fallback query /portia-list"), {
+    status: "any",
+    cursor: "abc123",
+    includeSubstringFallback: false,
+    query: "/portia-list",
+  });
+  assert.throws(() => parsePortiaSearchCommandArgs("cursor abc123"), /repeat the same query/);
 });
 
 test("senseMemories ranks proximity, dependency, and FTS memories", () => {

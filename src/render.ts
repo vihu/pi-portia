@@ -10,6 +10,8 @@ import type {
   PortiaListResult,
   PortiaRecordResult,
   PortiaRepairResult,
+  PortiaSearchHit,
+  PortiaSearchOutput,
   PortiaSettings,
   PortiaStats,
   PortiaTrailsResult,
@@ -206,6 +208,72 @@ export function renderMemoryList(result: PortiaListResult): string {
       lines.push("");
       lines.push(renderListMemory(memory));
     }
+  }
+
+  return lines.join("\n");
+}
+
+function renderSearchHit(hit: PortiaSearchHit): string {
+  const memory = hit.memory;
+  const headerParts = [
+    `- [${memory.id}]`,
+    memory.status,
+    memory.kind,
+    memory.scopePath,
+    `match=${hit.matchType}`,
+    `importance=${memory.importance}`,
+  ];
+  if (hit.score !== undefined) headerParts.push(`score=${hit.score.toFixed(3)}`);
+  headerParts.push(`updated=${memory.updatedAt}`);
+
+  const title = memory.title ? truncate(memory.title, 140) : truncate(memory.body.replace(/\s+/g, " ").trim(), 140);
+  const snippet = hit.snippet?.replace(/\s+/g, " ").trim();
+  const snippetLine = snippet ? `\n  snippet: ${truncate(snippet, 240)}` : "";
+  const source = renderMemorySource(memory);
+  const sourceLine = source ? `\n  source: ${truncate(source, 180)}` : "";
+
+  return `${headerParts.join(" ")}\n  ${title}${snippetLine}${sourceLine}`;
+}
+
+export function renderSearch(result: PortiaSearchOutput): string {
+  const lines: string[] = [];
+  lines.push("# Portia Search");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Query: ${result.filters.query}`);
+  lines.push(`Status: ${result.filters.status}`);
+  if (result.filters.scopePath) lines.push(`Scope: ${result.filters.scopePath} (${result.filters.scopeMode})`);
+  if (result.filters.kind) lines.push(`Kind: ${result.filters.kind}`);
+  lines.push(`Order: ${result.filters.orderBy}`);
+  lines.push(`Match mode: ${result.filters.matchMode}`);
+  lines.push(`Substring fallback: ${result.filters.includeSubstringFallback}`);
+  lines.push(`Limit: ${result.page.limit}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  lines.push("");
+  lines.push(`## Hits (${result.hits.length})`);
+  if (result.hits.length === 0) {
+    lines.push("No Portia memories matched this search.");
+  } else {
+    for (const hit of result.hits) {
+      lines.push("");
+      lines.push(renderSearchHit(hit));
+    }
+  }
+
+  lines.push("");
+  lines.push(`## Page`);
+  lines.push(`- limit: ${result.page.limit}`);
+  lines.push(`- hasMore: ${result.page.hasMore}`);
+  if (result.page.nextCursor) {
+    lines.push(`- nextCursor: ${result.page.nextCursor}`);
+    lines.push("- cursor usage: repeat the same query and filters with this cursor");
   }
 
   return lines.join("\n");
