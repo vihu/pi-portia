@@ -286,6 +286,113 @@ test("safe FTS query builder prevents malformed MATCH errors for code-like liter
   }
 });
 
+test("searchMemoryHits applies weighted FTS filters and substring fallback", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  function runSearch(rawQuery, overrides = {}) {
+    const built = buildSafeFtsQuery(rawQuery, { matchMode: overrides.matchMode });
+    assert.equal(built.ok, true, rawQuery);
+    if (!built.ok) return [];
+    return db.searchMemoryHits({
+      ftsQuery: built.query.expression,
+      rawQuery: built.query.rawQuery,
+      terms: built.query.terms,
+      matchMode: built.query.matchMode,
+      ...overrides,
+    });
+  }
+
+  try {
+    const titleHit = db.createMemory({
+      scopePath: "src/auth",
+      kind: "decision",
+      title: "Token search policy",
+      body: "Prefer the title result when ranking weighted full-text matches.",
+      importance: 4,
+      confidence: 100,
+    }).memory;
+    const bodyHit = db.createMemory({
+      scopePath: "src/auth/session",
+      kind: "gotcha",
+      title: "Session cache",
+      body: "Token search appears only in this body field for comparison.",
+      importance: 4,
+      confidence: 100,
+    }).memory;
+    const dbHit = db.createMemory({
+      scopePath: "src/db",
+      kind: "decision",
+      title: "Database note",
+      body: "Database-specific token search behavior.",
+      importance: 4,
+      confidence: 100,
+    }).memory;
+    const staleHit = db.createMemory({
+      scopePath: "src/auth",
+      kind: "decision",
+      title: "Token search stale note",
+      body: "Inactive token search result.",
+      importance: 10,
+      confidence: 100,
+    }).memory;
+    db.updateMemoryStatus({ id: staleHit.id, status: "stale", reason: "test fixture" });
+    const fallbackHit = db.createMemory({
+      scopePath: "src/config",
+      kind: "gotcha",
+      title: "Substring fallback fixture",
+      body: "Update maxSenseResults carefully when changing retrieval limits.",
+      importance: 1,
+      confidence: 100,
+    }).memory;
+
+    const relevance = runSearch("token search", { limit: 10 });
+    assert.equal(relevance.at(0)?.memory.id, titleHit.id);
+    assert.equal(relevance.at(0)?.matchType, "fts");
+    assert.match(relevance.at(0)?.snippet ?? "", /\[/);
+    assert.equal(relevance.some((hit) => hit.memory.id === bodyHit.id), true);
+    assert.equal(relevance.some((hit) => hit.memory.id === staleHit.id), false);
+
+    const importantHit = db.createMemory({
+      scopePath: "src/auth",
+      kind: "gotcha",
+      title: "Important body-only fixture",
+      body: "Token search should sort first when explicit importance ordering is requested.",
+      importance: 9,
+      confidence: 100,
+    }).memory;
+    const byImportance = runSearch("token search", { orderBy: "importance", limit: 10 });
+    assert.equal(byImportance.at(0)?.memory.id, importantHit.id);
+
+    const anyStatus = runSearch("token search", { status: "any", limit: 10 });
+    assert.equal(anyStatus.some((hit) => hit.memory.id === staleHit.id), true);
+
+    const decisions = runSearch("token search", { kind: "decision", limit: 10 });
+    assert.equal(decisions.some((hit) => hit.memory.id === titleHit.id), true);
+    assert.equal(decisions.some((hit) => hit.memory.id === dbHit.id), true);
+    assert.equal(decisions.some((hit) => hit.memory.id === bodyHit.id), false);
+
+    const authSubtree = runSearch("token search", { scopePath: "src/auth", scopeMode: "subtree", limit: 10 });
+    assert.equal(authSubtree.some((hit) => hit.memory.id === titleHit.id), true);
+    assert.equal(authSubtree.some((hit) => hit.memory.id === bodyHit.id), true);
+    assert.equal(authSubtree.some((hit) => hit.memory.id === dbHit.id), false);
+
+    const authExact = runSearch("token search", { scopePath: "src/auth", scopeMode: "exact", limit: 10 });
+    assert.equal(authExact.some((hit) => hit.memory.id === titleHit.id), true);
+    assert.equal(authExact.some((hit) => hit.memory.id === bodyHit.id), false);
+
+    const substring = runSearch("SenseRes", { limit: 10 });
+    assert.equal(substring.some((hit) => hit.memory.id === fallbackHit.id && hit.matchType === "substring"), true);
+
+    const withoutSubstring = runSearch("SenseRes", { includeSubstringFallback: false, limit: 10 });
+    assert.equal(withoutSubstring.some((hit) => hit.memory.id === fallbackHit.id), false);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("senseMemories ranks proximity, dependency, and FTS memories", () => {
   const project = tempProject();
   const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");

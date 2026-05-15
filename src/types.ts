@@ -325,6 +325,20 @@ export interface PortiaSearchOutput {
   warnings: string[];
 }
 
+export interface MemorySearchFilters {
+  ftsQuery: string;
+  rawQuery?: string;
+  terms?: string[];
+  status?: MemoryListStatus;
+  scopePath?: string;
+  scopeMode?: PortiaSearchScopeMode;
+  kind?: MemoryKind | string;
+  orderBy?: PortiaSearchOrderBy;
+  matchMode?: PortiaSearchMatchMode;
+  includeSubstringFallback?: boolean;
+  limit?: number;
+}
+
 export interface PortiaInspectInput {
   id: string;
   includeEvents?: boolean;
