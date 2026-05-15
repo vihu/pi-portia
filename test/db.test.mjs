@@ -975,6 +975,10 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
         autoSense: false,
         autoSenseMaxResults: 99,
         autoSenseMaxChars: 99_999,
+        searchDefaultLimit: 600,
+        searchMaxResults: 999,
+        listDefaultLimit: 90,
+        listMaxResults: 70,
         enablePheromones: false,
         pheromoneRanking: false,
         pheromoneHalfLifeDays: 45,
@@ -993,6 +997,10 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
     assert.equal(resolved.autoSense, false);
     assert.equal(resolved.autoSenseMaxResults, 12);
     assert.equal(resolved.autoSenseMaxChars, 12_000);
+    assert.equal(resolved.searchDefaultLimit, 500);
+    assert.equal(resolved.searchMaxResults, 500);
+    assert.equal(resolved.listDefaultLimit, 70);
+    assert.equal(resolved.listMaxResults, 70);
     assert.equal(resolved.enablePheromones, false);
     assert.equal(resolved.pheromoneRanking, false);
     assert.equal(resolved.pheromoneHalfLifeDays, 45);

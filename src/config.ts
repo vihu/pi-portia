@@ -7,6 +7,7 @@ import type { PheromoneWorkerPolicy, PortiaMode, PortiaSettings, WritePolicy } f
 
 const SETTINGS_KEY = "portia";
 const DEFAULT_DB_PATH = ".pi/portia/portia.sqlite";
+const ABSOLUTE_BROWSE_LIMIT = 500;
 
 interface PartialPortiaSettings {
   enabled?: boolean;
@@ -14,6 +15,10 @@ interface PartialPortiaSettings {
   writePolicy?: WritePolicy;
   workerWritePolicy?: WritePolicy;
   maxSenseResults?: number;
+  searchDefaultLimit?: number;
+  searchMaxResults?: number;
+  listDefaultLimit?: number;
+  listMaxResults?: number;
   enableDependencyScan?: boolean;
   enableFts?: boolean;
   enableVectors?: boolean;
@@ -100,6 +105,18 @@ function parseSettingsFile(filePath: string): PartialPortiaSettings {
   const maxSenseResults = parsePositiveInteger(input.maxSenseResults);
   if (maxSenseResults) settings.maxSenseResults = Math.min(maxSenseResults, 50);
 
+  const searchDefaultLimit = parsePositiveInteger(input.searchDefaultLimit);
+  if (searchDefaultLimit) settings.searchDefaultLimit = Math.min(searchDefaultLimit, ABSOLUTE_BROWSE_LIMIT);
+
+  const searchMaxResults = parsePositiveInteger(input.searchMaxResults);
+  if (searchMaxResults) settings.searchMaxResults = Math.min(searchMaxResults, ABSOLUTE_BROWSE_LIMIT);
+
+  const listDefaultLimit = parsePositiveInteger(input.listDefaultLimit);
+  if (listDefaultLimit) settings.listDefaultLimit = Math.min(listDefaultLimit, ABSOLUTE_BROWSE_LIMIT);
+
+  const listMaxResults = parsePositiveInteger(input.listMaxResults);
+  if (listMaxResults) settings.listMaxResults = Math.min(listMaxResults, ABSOLUTE_BROWSE_LIMIT);
+
   const enableDependencyScan = parseBoolean(input.enableDependencyScan);
   if (enableDependencyScan !== undefined) settings.enableDependencyScan = enableDependencyScan;
 
@@ -177,6 +194,10 @@ export function resolvePortiaSettings(cwd: string): PortiaSettings {
     writePolicy: "confirm" as WritePolicy,
     workerWritePolicy: "readonly" as WritePolicy,
     maxSenseResults: 12,
+    searchDefaultLimit: 30,
+    searchMaxResults: 250,
+    listDefaultLimit: 30,
+    listMaxResults: 250,
     enableDependencyScan: true,
     enableFts: true,
     enableVectors: false,
@@ -202,11 +223,19 @@ export function resolvePortiaSettings(cwd: string): PortiaSettings {
   const envMode = parseMode(process.env.PORTIA_MODE?.trim().toLowerCase());
   const enabled = envMode === "off" ? false : merged.enabled;
   const effectiveWritePolicy = envMode && envMode !== "off" ? envMode : merged.writePolicy;
+  const searchMaxResults = Math.min(merged.searchMaxResults, ABSOLUTE_BROWSE_LIMIT);
+  const listMaxResults = Math.min(merged.listMaxResults, ABSOLUTE_BROWSE_LIMIT);
+  const searchDefaultLimit = Math.min(merged.searchDefaultLimit, searchMaxResults);
+  const listDefaultLimit = Math.min(merged.listDefaultLimit, listMaxResults);
 
   return {
     ...merged,
     enabled,
     effectiveWritePolicy,
+    searchDefaultLimit,
+    searchMaxResults,
+    listDefaultLimit,
+    listMaxResults,
     modeOverride: envMode,
     dbPath: resolveConfiguredPath(merged.dbPath, projectRoot),
     projectRoot,
