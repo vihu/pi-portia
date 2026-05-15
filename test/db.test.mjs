@@ -13,6 +13,7 @@ import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState,
 import { recordPortiaMemory } from "../src/record.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
 import { senseMemories } from "../src/retrieval.ts";
+import { buildSafeFtsQuery, parsePlainSearchTerms } from "../src/search.ts";
 import { listPortiaTrails } from "../src/trails.ts";
 
 function tempProject() {
@@ -116,6 +117,62 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
     assert.equal(reopened.getStats().activeMemories, 1);
     assert.equal(reopened.getActiveMemoriesByScopes(["src/auth"]).at(0)?.id, "auth-gotcha");
     assert.equal(reopened.searchActiveMemories('"fixtures"', 10).at(0)?.id, "auth-gotcha");
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("safe FTS query builder quotes plain user input", () => {
+  assert.deepEqual(parsePlainSearchTerms('alpha "beta gamma" delta'), ["alpha", "beta gamma", "delta"]);
+  assert.deepEqual(parsePlainSearchTerms('/portia-list src/config.ts foo:bar'), ["/portia-list", "src/config.ts", "foo:bar"]);
+
+  const all = buildSafeFtsQuery("alpha beta");
+  assert.equal(all.ok, true);
+  if (all.ok) assert.equal(all.query.expression, '"alpha" "beta"');
+
+  const any = buildSafeFtsQuery("alpha beta", { matchMode: "any" });
+  assert.equal(any.ok, true);
+  if (any.ok) assert.equal(any.query.expression, '"alpha" OR "beta"');
+
+  const phrase = buildSafeFtsQuery('alpha "beta"', { matchMode: "phrase" });
+  assert.equal(phrase.ok, true);
+  if (phrase.ok) assert.equal(phrase.query.expression, '"alpha ""beta"""');
+
+  const empty = buildSafeFtsQuery("   ");
+  assert.equal(empty.ok, false);
+  if (!empty.ok) assert.equal(empty.error.reason, "empty");
+
+  const tooLong = buildSafeFtsQuery("x".repeat(501));
+  assert.equal(tooLong.ok, false);
+  if (!tooLong.ok) assert.equal(tooLong.error.reason, "too_long");
+});
+
+test("safe FTS query builder prevents malformed MATCH errors for code-like literals", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+
+  insertMemory(dbPath, {
+    id: "literal-search-fixture",
+    scope_path: "src/config.ts",
+    kind: "gotcha",
+    title: "Literal /portia-list search fixture",
+    body: 'Search for -6 /portia-list src/config.ts foo:bar v1.2 "quoted" AND OR NOT without raw FTS syntax errors.',
+  });
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    for (const rawQuery of ["-6", "/portia-list", "src/config.ts", "foo:bar", "v1.2", '"quoted"', "AND OR NOT"]) {
+      const built = buildSafeFtsQuery(rawQuery);
+      assert.equal(built.ok, true, rawQuery);
+      if (!built.ok) continue;
+
+      const results = reopened.searchActiveMemories(built.query.expression, 10);
+      assert.equal(results.some((memory) => memory.id === "literal-search-fixture"), true, rawQuery);
+    }
   } finally {
     reopened.close();
     fs.rmSync(project, { recursive: true, force: true });
