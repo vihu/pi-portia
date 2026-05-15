@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
+import { buildSearchTerms } from "./search.ts";
 
 type DatabaseConnection = InstanceType<typeof Database>;
 import type {
@@ -23,7 +24,7 @@ import type {
   UpdateMemoryStatusResult,
 } from "./types.ts";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const MIN_PHEROMONE_STRENGTH = -5;
 const MAX_PHEROMONE_STRENGTH = 20;
 
@@ -103,6 +104,25 @@ interface ScopeCountRow {
 
 interface FtsRow extends MemoryRow {
   score: number;
+}
+
+interface TableInfoRow {
+  name: string;
+}
+
+interface SearchTermsBackfillRow {
+  rowid: number;
+  scope_path: string;
+  kind: string;
+  title: string | null;
+  body: string;
+  source_type: string | null;
+  source_ref: string | null;
+}
+
+interface TriggerSqlRow {
+  name: string;
+  sql: string | null;
 }
 
 function toMemory(row: MemoryRow): MemoryRecord {
@@ -252,6 +272,140 @@ function relatedScore(queryTokens: Set<string>, memory: MemoryRecord): number {
   return overlap / Math.sqrt(queryTokens.size * memoryTokens.size);
 }
 
+function tableColumns(db: DatabaseConnection, tableName: string): string[] {
+  return (db.prepare(`pragma table_info(${tableName})`).all() as TableInfoRow[]).map((row) => row.name);
+}
+
+function ensureSearchTermsColumn(db: DatabaseConnection): void {
+  if (!tableColumns(db, "memories").includes("search_terms")) {
+    db.exec("alter table memories add column search_terms text");
+  }
+}
+
+function memoryFtsNeedsRebuild(db: DatabaseConnection): boolean {
+  const exists = (db.prepare("select count(*) as count from sqlite_master where type = 'table' and name = 'memory_fts'").get() as CountRow | undefined)?.count ?? 0;
+  if (exists === 0) return true;
+
+  const expectedColumns = ["title", "body", "scope_path", "kind", "source_type", "source_ref", "search_terms"];
+  const existingColumns = tableColumns(db, "memory_fts");
+  return expectedColumns.join("|") !== existingColumns.join("|");
+}
+
+function memoryFtsTriggersNeedRebuild(db: DatabaseConnection): boolean {
+  const expectedNames = new Set(["memories_ai", "memories_ad", "memories_au"]);
+  const rows = db.prepare(`
+    select name, sql
+    from sqlite_master
+    where type = 'trigger' and name in ('memories_ai', 'memories_ad', 'memories_au')
+  `).all() as TriggerSqlRow[];
+
+  if (rows.length !== expectedNames.size) return true;
+  for (const row of rows) {
+    expectedNames.delete(row.name);
+    const sql = row.sql ?? "";
+    if (!sql.includes("source_type") || !sql.includes("source_ref") || !sql.includes("search_terms")) return true;
+  }
+
+  return expectedNames.size > 0;
+}
+
+function dropMemoryFtsTriggers(db: DatabaseConnection): void {
+  db.exec(`
+    drop trigger if exists memories_ai;
+    drop trigger if exists memories_ad;
+    drop trigger if exists memories_au;
+  `);
+}
+
+function createMemoryFts(db: DatabaseConnection): void {
+  db.exec(`
+    create virtual table if not exists memory_fts using fts5(
+      title,
+      body,
+      scope_path,
+      kind,
+      source_type,
+      source_ref,
+      search_terms,
+      content='memories',
+      content_rowid='rowid'
+    );
+  `);
+}
+
+function createMemoryFtsTriggers(db: DatabaseConnection): void {
+  dropMemoryFtsTriggers(db);
+  db.exec(`
+    create trigger memories_ai after insert on memories begin
+      insert into memory_fts(rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values (new.rowid, new.title, new.body, new.scope_path, new.kind, new.source_type, new.source_ref, new.search_terms);
+    end;
+
+    create trigger memories_ad after delete on memories begin
+      insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind, old.source_type, old.source_ref, old.search_terms);
+    end;
+
+    create trigger memories_au after update on memories begin
+      insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind, old.source_type, old.source_ref, old.search_terms);
+      insert into memory_fts(rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values (new.rowid, new.title, new.body, new.scope_path, new.kind, new.source_type, new.source_ref, new.search_terms);
+    end;
+  `);
+}
+
+function backfillSearchTerms(db: DatabaseConnection): number {
+  const rows = db.prepare(`
+    select rowid, scope_path, kind, title, body, source_type, source_ref
+    from memories
+    where search_terms is null
+    order by rowid asc
+  `).all() as SearchTermsBackfillRow[];
+
+  if (rows.length === 0) return 0;
+
+  const update = db.prepare("update memories set search_terms = @searchTerms where rowid = @rowid");
+  let changed = 0;
+  for (const row of rows) {
+    const result = update.run({
+      rowid: row.rowid,
+      searchTerms: buildSearchTerms({
+        scopePath: row.scope_path,
+        kind: row.kind,
+        title: row.title,
+        body: row.body,
+        sourceType: row.source_type,
+        sourceRef: row.source_ref,
+      }),
+    }) as { changes?: number };
+    changed += result.changes ?? 0;
+  }
+
+  return changed;
+}
+
+function rebuildMemoryFts(db: DatabaseConnection): void {
+  db.prepare("insert into memory_fts(memory_fts) values ('rebuild')").run();
+}
+
+function ensureMemoryFts(db: DatabaseConnection): void {
+  const ftsNeedsRebuild = memoryFtsNeedsRebuild(db);
+  const triggersNeedRebuild = ftsNeedsRebuild || memoryFtsTriggersNeedRebuild(db);
+  if (triggersNeedRebuild) dropMemoryFtsTriggers(db);
+
+  const backfilledRows = backfillSearchTerms(db);
+
+  if (ftsNeedsRebuild) {
+    db.exec("drop table if exists memory_fts");
+    createMemoryFts(db);
+  }
+
+  if (triggersNeedRebuild) createMemoryFtsTriggers(db);
+
+  if (ftsNeedsRebuild || backfilledRows > 0) rebuildMemoryFts(db);
+}
+
 function runMigrations(db: DatabaseConnection): void {
   const migrate = db.transaction(() => {
     db.exec(`
@@ -274,38 +428,13 @@ function runMigrations(db: DatabaseConnection): void {
         created_by text,
         supersedes_id text references memories(id),
         source_type text,
-        source_ref text
+        source_ref text,
+        search_terms text
       );
 
       create index if not exists memories_status_scope_idx on memories(status, scope_path);
       create index if not exists memories_kind_idx on memories(kind);
       create index if not exists memories_updated_idx on memories(updated_at);
-
-      create virtual table if not exists memory_fts using fts5(
-        title,
-        body,
-        scope_path,
-        kind,
-        content='memories',
-        content_rowid='rowid'
-      );
-
-      create trigger if not exists memories_ai after insert on memories begin
-        insert into memory_fts(rowid, title, body, scope_path, kind)
-        values (new.rowid, new.title, new.body, new.scope_path, new.kind);
-      end;
-
-      create trigger if not exists memories_ad after delete on memories begin
-        insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind)
-        values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind);
-      end;
-
-      create trigger if not exists memories_au after update on memories begin
-        insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind)
-        values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind);
-        insert into memory_fts(rowid, title, body, scope_path, kind)
-        values (new.rowid, new.title, new.body, new.scope_path, new.kind);
-      end;
 
       create table if not exists memory_events (
         id text primary key,
@@ -364,6 +493,9 @@ function runMigrations(db: DatabaseConnection): void {
       );
     `);
 
+    ensureSearchTermsColumn(db);
+    ensureMemoryFts(db);
+
     db.prepare(`
       insert into portia_meta(key, value)
       values ('schema_version', ?)
@@ -419,15 +551,23 @@ export class PortiaDatabase {
     const now = new Date().toISOString();
     const createdBy = input.createdBy ?? "portia";
     const payloadJson = JSON.stringify(input.eventPayload ?? { action: "record" });
+    const searchTerms = buildSearchTerms({
+      scopePath: input.scopePath,
+      kind: input.kind,
+      title: input.title,
+      body: input.body,
+      sourceType: input.sourceType,
+      sourceRef: input.sourceRef,
+    });
 
     const insert = this.db.transaction(() => {
       this.db.prepare(`
         insert into memories (
           id, scope_path, kind, title, body, status, importance, confidence,
-          created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+          created_at, updated_at, created_by, supersedes_id, source_type, source_ref, search_terms
         ) values (
           @id, @scopePath, @kind, @title, @body, 'active', @importance, @confidence,
-          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef
+          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef, @searchTerms
         )
       `).run({
         id,
@@ -443,6 +583,7 @@ export class PortiaDatabase {
         supersedesId: input.supersedesId ?? null,
         sourceType: input.sourceType ?? null,
         sourceRef: input.sourceRef ?? null,
+        searchTerms,
       });
 
       this.db.prepare(`
@@ -477,6 +618,14 @@ export class PortiaDatabase {
     const now = new Date().toISOString();
     const createdBy = input.createdBy ?? "portia";
     const payloadJson = JSON.stringify(input.eventPayload ?? { action: "record" });
+    const searchTerms = buildSearchTerms({
+      scopePath: input.scopePath,
+      kind: input.kind,
+      title: input.title,
+      body: input.body,
+      sourceType: input.sourceType,
+      sourceRef: input.sourceRef,
+    });
     const eventPayload = input.eventPayload ?? {};
     const evidence = typeof eventPayload.evidence === "string" ? eventPayload.evidence : undefined;
     const supersedePayloadJson = JSON.stringify({
@@ -494,10 +643,10 @@ export class PortiaDatabase {
       this.db.prepare(`
         insert into memories (
           id, scope_path, kind, title, body, status, importance, confidence,
-          created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+          created_at, updated_at, created_by, supersedes_id, source_type, source_ref, search_terms
         ) values (
           @id, @scopePath, @kind, @title, @body, 'active', @importance, @confidence,
-          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef
+          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef, @searchTerms
         )
       `).run({
         id,
@@ -513,6 +662,7 @@ export class PortiaDatabase {
         supersedesId: input.supersedesId,
         sourceType: input.sourceType ?? null,
         sourceRef: input.sourceRef ?? null,
+        searchTerms,
       });
 
       this.db.prepare(`

@@ -13,7 +13,7 @@ import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState,
 import { recordPortiaMemory } from "../src/record.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
 import { senseMemories } from "../src/retrieval.ts";
-import { buildSafeFtsQuery, parsePlainSearchTerms } from "../src/search.ts";
+import { buildSafeFtsQuery, buildSearchTerms, parsePlainSearchTerms } from "../src/search.ts";
 import { listPortiaTrails } from "../src/trails.ts";
 
 function tempProject() {
@@ -97,7 +97,7 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
   const db = openPortiaDatabase(dbPath);
   try {
     const stats = db.getStats();
-    assert.equal(stats.schemaVersion, 2);
+    assert.equal(stats.schemaVersion, 3);
     assert.equal(stats.ftsAvailable, true);
     assert.equal(stats.totalMemories, 0);
   } finally {
@@ -123,7 +123,114 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
   }
 });
 
+test("schema v3 migrates FTS metadata and generated search terms", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    create table portia_meta (key text primary key, value text not null);
+    insert into portia_meta(key, value) values ('schema_version', '2');
+
+    create table memories (
+      id text primary key,
+      scope_path text not null,
+      kind text not null,
+      title text,
+      body text not null,
+      status text not null default 'active',
+      importance integer not null default 0,
+      confidence integer not null default 100,
+      created_at text not null,
+      updated_at text not null,
+      created_by text,
+      supersedes_id text references memories(id),
+      source_type text,
+      source_ref text
+    );
+
+    create virtual table memory_fts using fts5(
+      title,
+      body,
+      scope_path,
+      kind,
+      content='memories',
+      content_rowid='rowid'
+    );
+  `);
+  legacy.prepare(`
+    insert into memories (
+      id, scope_path, kind, title, body, status, importance, confidence,
+      created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+    ) values (
+      'legacy-search', 'src/config.ts', 'gotcha', 'Legacy search metadata',
+      'Changing maxSenseResults must be searchable by component words.',
+      'active', 5, 100, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
+      'test', null, 'manual', 'docs/LegacyNote.md'
+    )
+  `).run();
+  legacy.close();
+
+  const migrated = openPortiaDatabase(dbPath);
+  try {
+    assert.equal(migrated.getStats().schemaVersion, 3);
+
+    for (const rawQuery of ["max sense results", "manual", "legacy note"]) {
+      const built = buildSafeFtsQuery(rawQuery);
+      assert.equal(built.ok, true, rawQuery);
+      if (!built.ok) continue;
+      const results = migrated.searchActiveMemories(built.query.expression, 10);
+      assert.equal(results.some((memory) => memory.id === "legacy-search"), true, rawQuery);
+    }
+
+    const created = migrated.createMemory({
+      scopePath: "src/search.ts",
+      kind: "gotcha",
+      title: "Post-migration trigger fixture",
+      body: "Changing newCamelIdentifier should be searchable after migration.",
+      importance: 5,
+      confidence: 100,
+      sourceType: "test",
+      sourceRef: "docs/NewMemoryNote.md",
+    }).memory;
+
+    for (const rawQuery of ["new camel identifier", "new memory note"]) {
+      const built = buildSafeFtsQuery(rawQuery);
+      assert.equal(built.ok, true, rawQuery);
+      if (!built.ok) continue;
+      const results = migrated.searchActiveMemories(built.query.expression, 10);
+      assert.equal(results.some((memory) => memory.id === created.id), true, rawQuery);
+    }
+  } finally {
+    migrated.close();
+  }
+
+  const inspected = new Database(dbPath);
+  try {
+    const memoryColumns = inspected.prepare("pragma table_info(memories)").all().map((row) => row.name);
+    const ftsColumns = inspected.prepare("pragma table_info(memory_fts)").all().map((row) => row.name);
+    assert.equal(memoryColumns.includes("search_terms"), true);
+    assert.deepEqual(ftsColumns, ["title", "body", "scope_path", "kind", "source_type", "source_ref", "search_terms"]);
+  } finally {
+    inspected.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("safe FTS query builder quotes plain user input", () => {
+  const searchTerms = buildSearchTerms({
+    scopePath: "src/config.ts",
+    kind: "gotcha",
+    body: "Adjust maxSenseResults and SQL_ERROR handling.",
+    sourceRef: "docs/LegacyNote.md",
+  });
+  assert.match(searchTerms, /\bmax\b/);
+  assert.match(searchTerms, /\bsense\b/);
+  assert.match(searchTerms, /\bresults\b/);
+  assert.match(searchTerms, /\blegacy\b/);
+  assert.match(searchTerms, /\bnote\b/);
+
   assert.deepEqual(parsePlainSearchTerms('alpha "beta gamma" delta'), ["alpha", "beta gamma", "delta"]);
   assert.deepEqual(parsePlainSearchTerms('/portia-list src/config.ts foo:bar'), ["/portia-list", "src/config.ts", "foo:bar"]);
 
