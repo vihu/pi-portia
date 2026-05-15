@@ -87,6 +87,14 @@ function parseListArgs(args: string): PortiaListInput {
       continue;
     }
 
+    if (token === "cursor") {
+      const value = tokens[index + 1];
+      if (!value) throw new Error("Usage: /portia-list cursor <cursor> (repeat the same filters used for the previous page)");
+      input.cursor = value;
+      index += 2;
+      continue;
+    }
+
     input.query = tokens.slice(index).join(" ");
     break;
   }
@@ -309,7 +317,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("portia-list", {
-    description: "List Portia memories: /portia-list [active|all|stale|deleted] [scope <path>|kind <kind>|query <text>]",
+    description: "List Portia memories: /portia-list [active|all|stale|deleted] [scope <path>|kind <kind>|query <text>|limit <n>|cursor <cursor>]; repeat filters with cursor.",
     handler: async (args, ctx) => {
       const settings = resolvePortiaSettings(ctx.cwd);
       if (!settings.enabled) {

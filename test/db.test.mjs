@@ -1198,6 +1198,64 @@ test("listPortiaMemories filters by status, scope, kind, and query", () => {
   }
 });
 
+test("listPortiaMemories applies configured limits and cursor pagination", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+
+  for (let index = 1; index <= 5; index += 1) {
+    insertMemory(dbPath, {
+      id: `list-page-${index}`,
+      scope_path: "src/list",
+      kind: "pointer",
+      title: `List pagination ${index}`,
+      body: "List pagination fixtures should be browsable with cursors.",
+      importance: 10 - index,
+      updated_at: `2026-05-15T00:0${index}:00.000Z`,
+    });
+  }
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    const first = listPortiaMemories(reopened, settings(project, dbPath, {
+      listDefaultLimit: 2,
+      listMaxResults: 3,
+    }), { scopePath: "src/list" }, project);
+
+    assert.deepEqual(first.memories.map((memory) => memory.id), ["list-page-1", "list-page-2"]);
+    assert.equal(first.filters.limit, 2);
+    assert.equal(first.page.limit, 2);
+    assert.equal(first.page.hasMore, true);
+    assert.equal(typeof first.page.nextCursor, "string");
+
+    const second = listPortiaMemories(reopened, settings(project, dbPath, {
+      listDefaultLimit: 2,
+      listMaxResults: 3,
+    }), { scopePath: "src/list", cursor: first.page.nextCursor }, project);
+    assert.deepEqual(second.memories.map((memory) => memory.id), ["list-page-3", "list-page-4"]);
+    assert.equal(second.filters.cursor, first.page.nextCursor);
+    assert.equal(second.page.hasMore, true);
+
+    const capped = listPortiaMemories(reopened, settings(project, dbPath, {
+      listDefaultLimit: 2,
+      listMaxResults: 3,
+    }), { scopePath: "src/list", limit: 99 }, project);
+    assert.equal(capped.filters.limit, 3);
+    assert.equal(capped.memories.length, 3);
+    assert.match(capped.warnings.join("\n"), /listMaxResults 3/);
+
+    assert.throws(() => listPortiaMemories(reopened, settings(project, dbPath), {
+      status: "any",
+      scopePath: "src/list",
+      cursor: first.page.nextCursor,
+    }, project), /cursor does not match/);
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("inspectPortiaMemory returns memory details and event history", () => {
   const project = tempProject();
   const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");

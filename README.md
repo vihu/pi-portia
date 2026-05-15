@@ -14,7 +14,7 @@ Implemented now:
 - project-local DB at `.pi/portia/portia.sqlite`
 - `/portia-status`
 - `/portia-sense <path> [query]`
-- `/portia-list`
+- `/portia-list` with structured filters, configurable page limits, and cursor pagination
 - `/portia-search <query>` with safe FTS5 search, ranking, snippets, filters, and cursor pagination
 - `/portia-inspect <id>`
 - `/portia-repair <id> <stale|delete|reactivate> <reason>`
@@ -37,7 +37,6 @@ Not implemented yet:
 - reflection/proposal workflow
 - vector search
 - public `/portia-reindex` maintenance command
-- cursor pagination for `portia_list`
 
 ## Installation
 
@@ -94,6 +93,9 @@ You can still run explicit commands:
 /portia-list kind decision
 /portia-list scope src/auth
 /portia-list query autopilot
+/portia-list limit 50
+/portia-list scope src/auth cursor <nextCursor>
+/portia-list cursor <nextCursor> query autopilot
 /portia-search portia search limits
 /portia-search query max sense results
 /portia-search kind decision search limits
@@ -114,7 +116,7 @@ Tool/command quick reference:
 | ------------------------------------ | ----------------------------------- | ----------------------------------------------------------------------------- |
 | `portia_sense` / `/portia-sense`     | bounded path/task context           | compact output for agent context; not for exhaustive browsing                 |
 | `portia_search` / `/portia-search`   | explicit keyword search             | safe FTS5 queries, snippets, filters, and cursor pagination                   |
-| `portia_list` / `/portia-list`       | structured inventory/audit browsing | status/kind/scope/query filters; list cursor pagination is planned separately |
+| `portia_list` / `/portia-list`       | structured inventory/audit browsing | status/kind/scope/query filters, configurable limits, and cursor pagination   |
 | `portia_inspect` / `/portia-inspect` | full details for one memory         | provenance, event history, and pheromone summary                              |
 | `portia_record`                      | write or propose durable memories   | honors `writePolicy`/`workerWritePolicy`                                      |
 | `portia_repair` / `/portia-repair`   | soft-repair memory status           | marks stale/deleted/active without physical deletion                          |
@@ -125,7 +127,9 @@ Use `portia_search`/`/portia-search` for explicit keyword search across memories
 
 Search query text is plain input, not raw FTS syntax. Portia quotes search terms before sending them to SQLite FTS5, so code-like literals such as `/portia-list`, `src/config.ts`, `foo:bar`, `-6`, and words like `AND`/`OR` are treated safely instead of as operators. Default `matchMode` is `all`; use `match any` for broader recall or `match phrase` for an exact phrase. Generated `search_terms` help component searches find code/camelCase text such as `maxSenseResults` from `max sense results`.
 
-Use `portia_list`/`/portia-list` for structured inventory browsing/auditing, `portia_inspect`/`/portia-inspect` to view one memory with provenance, event history, and a compact pheromone summary, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records. `/portia-delete <id> <reason>` is a shorter human-facing alias for soft deletion. Use `/portia-trails` to inspect reinforced, weak, recent, or per-memory pheromone traces.
+Use `portia_list`/`/portia-list` for structured inventory browsing/auditing. List keeps `query` as a simple case-insensitive substring inventory filter over memory title, body, scope, kind, and provenance; use `portia_search` for FTS relevance ranking and snippets. List output includes page metadata and `nextCursor` when more rows are available. Repeat the same status/scope/kind/query filters with the cursor to continue browsing. In slash-command syntax, put `cursor <nextCursor>` before `query <text>` because `query` consumes the rest of the command.
+
+Use `portia_inspect`/`/portia-inspect` to view one memory with provenance, event history, and a compact pheromone summary, and `portia_repair`/`/portia-repair` to soft-mark memories `stale`, `deleted`, or active again via `reactivate`. Repair keeps rows and appends memory events; it does not physically delete records. `/portia-delete <id> <reason>` is a shorter human-facing alias for soft deletion. Use `/portia-trails` to inspect reinforced, weak, recent, or per-memory pheromone traces.
 
 The main agent can call `portia_record` after verified durable project findings, for example:
 
@@ -217,7 +221,8 @@ Search and browse settings:
 - `maxSenseResults`: default maximum for `portia_sense`; capped at 50 so context retrieval stays bounded
 - `searchDefaultLimit`: default page size for `portia_search`; default `30`
 - `searchMaxResults`: maximum accepted `portia_search` page size; default `250`, absolute cap `500`
-- `listDefaultLimit` and `listMaxResults`: parsed for list browsing configuration; `portia_list` cursor/default-limit adoption is planned in the list ergonomics phase
+- `listDefaultLimit`: default page size for `portia_list`; default `30`
+- `listMaxResults`: maximum accepted `portia_list` page size; default `250`, absolute cap `500`
 
 Pheromone settings:
 

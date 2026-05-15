@@ -192,6 +192,7 @@ export function renderMemoryList(result: PortiaListResult): string {
   if (result.filters.kind) lines.push(`Kind: ${result.filters.kind}`);
   if (result.filters.query) lines.push(`Query: ${result.filters.query}`);
   lines.push(`Limit: ${result.filters.limit}`);
+  if (result.filters.cursor) lines.push("Cursor: provided");
 
   if (result.warnings.length > 0) {
     lines.push("");
@@ -208,6 +209,15 @@ export function renderMemoryList(result: PortiaListResult): string {
       lines.push("");
       lines.push(renderListMemory(memory));
     }
+  }
+
+  lines.push("");
+  lines.push("## Page");
+  lines.push(`- limit: ${result.page.limit}`);
+  lines.push(`- hasMore: ${result.page.hasMore}`);
+  if (result.page.nextCursor) {
+    lines.push(`- nextCursor: ${result.page.nextCursor}`);
+    lines.push("- cursor usage: repeat the same filters with this cursor");
   }
 
   return lines.join("\n");

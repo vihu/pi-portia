@@ -252,12 +252,24 @@ export interface PortiaRecordResult {
   supersedeEvent?: MemoryEvent;
 }
 
+export interface PortiaListPage {
+  limit: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
 export interface MemoryListFilters {
   status?: MemoryListStatus;
   scopePath?: string;
   kind?: MemoryKind | string;
   query?: string;
   limit?: number;
+  cursor?: string;
+}
+
+export interface MemoryListResult {
+  memories: MemoryRecord[];
+  page: PortiaListPage;
 }
 
 export interface PortiaListResult {
@@ -269,8 +281,10 @@ export interface PortiaListResult {
     kind?: MemoryKind;
     query?: string;
     limit: number;
+    cursor?: string;
   };
   memories: MemoryRecord[];
+  page: PortiaListPage;
   warnings: string[];
 }
 

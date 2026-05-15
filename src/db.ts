@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
@@ -15,6 +15,7 @@ import type {
   ListPheromonesFilters,
   MemoryEvent,
   MemoryListFilters,
+  MemoryListResult,
   MemoryPheromone,
   MemoryPheromoneSummary,
   MemoryRecord,
@@ -30,7 +31,9 @@ import type {
 } from "./types.ts";
 
 const SCHEMA_VERSION = 3;
-const MAX_SEARCH_LIMIT = 500;
+const MAX_BROWSE_LIMIT = 500;
+const MAX_SEARCH_LIMIT = MAX_BROWSE_LIMIT;
+const LIST_CURSOR_TYPE = "portia_list";
 const MIN_PHEROMONE_STRENGTH = -5;
 const MAX_PHEROMONE_STRENGTH = 20;
 
@@ -114,6 +117,20 @@ interface FtsRow extends MemoryRow {
 
 interface SearchFtsRow extends FtsRow {
   snippet: string | null;
+}
+
+interface ListCursorAfter {
+  id: string;
+  status: string;
+  importance: number;
+  updatedAt: string;
+}
+
+interface ListCursorPayload {
+  v: 1;
+  type: typeof LIST_CURSOR_TYPE;
+  fingerprint: string;
+  after: ListCursorAfter;
 }
 
 interface TableInfoRow {
@@ -225,6 +242,11 @@ function clampLimit(value: number | undefined, fallback: number): number {
 function clampSearchLimit(value: number | undefined, fallback: number): number {
   if (!value || !Number.isFinite(value)) return fallback;
   return Math.max(1, Math.min(MAX_SEARCH_LIMIT, Math.floor(value)));
+}
+
+function clampBrowseLimit(value: number | undefined, fallback: number): number {
+  if (!value || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(MAX_BROWSE_LIMIT, Math.floor(value)));
 }
 
 function memoryColumn(alias: string, column: string): string {
@@ -374,9 +396,18 @@ function memorySelectSql(): string {
   `;
 }
 
-function memoryStatusOrderSql(): string {
+function memoryStatusRank(status: string): number {
+  if (status === "active") return 0;
+  if (status === "stale") return 1;
+  if (status === "superseded") return 2;
+  if (status === "deleted") return 3;
+  return 9;
+}
+
+function memoryStatusOrderSql(alias = ""): string {
+  const status = memoryColumn(alias, "status");
   return `
-    case status
+    case ${status}
       when 'active' then 0
       when 'stale' then 1
       when 'superseded' then 2
@@ -384,6 +415,120 @@ function memoryStatusOrderSql(): string {
       else 9
     end
   `;
+}
+
+function listCursorFingerprint(filters: MemoryListFilters): string {
+  const normalized = {
+    status: filters.status ?? undefined,
+    scopePath: filters.scopePath ?? undefined,
+    kind: filters.kind ?? undefined,
+    query: filters.query?.trim().toLowerCase() || undefined,
+    orderBy: "inventory",
+  };
+
+  return createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("base64url")
+    .slice(0, 24);
+}
+
+function isListCursorAfter(value: unknown): value is ListCursorAfter {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as ListCursorAfter;
+  return typeof candidate.id === "string" && candidate.id.length > 0
+    && typeof candidate.status === "string" && candidate.status.length > 0
+    && typeof candidate.importance === "number" && Number.isFinite(candidate.importance)
+    && typeof candidate.updatedAt === "string" && candidate.updatedAt.length > 0;
+}
+
+function encodeListCursor(payload: ListCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url");
+}
+
+function decodeListCursor(cursor: string, expectedFingerprint: string): ListCursorPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+  } catch {
+    throw new Error("Invalid Portia list cursor: cursor is not valid encoded JSON.");
+  }
+
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid Portia list cursor: cursor payload is not an object.");
+  const payload = parsed as ListCursorPayload;
+  if (payload.v !== 1 || payload.type !== LIST_CURSOR_TYPE || !isListCursorAfter(payload.after)) {
+    throw new Error("Invalid Portia list cursor: unsupported cursor payload.");
+  }
+  if (payload.fingerprint !== expectedFingerprint) {
+    throw new Error("Invalid Portia list cursor: cursor does not match the current filters.");
+  }
+
+  return payload;
+}
+
+function listCursorAfterMemory(memory: MemoryRecord): ListCursorAfter {
+  return {
+    id: memory.id,
+    status: memory.status,
+    importance: memory.importance,
+    updatedAt: memory.updatedAt,
+  };
+}
+
+function encodeNextListCursor(fingerprint: string, memory: MemoryRecord): string {
+  return encodeListCursor({
+    v: 1,
+    type: LIST_CURSOR_TYPE,
+    fingerprint,
+    after: listCursorAfterMemory(memory),
+  });
+}
+
+function appendListCursorClause(clauses: string[], params: Record<string, unknown>, after: ListCursorAfter, alias = ""): void {
+  const id = memoryColumn(alias, "id");
+  const importance = memoryColumn(alias, "importance");
+  const updatedAt = memoryColumn(alias, "updated_at");
+  const statusRank = memoryStatusOrderSql(alias);
+  params.cursorStatusRank = memoryStatusRank(after.status);
+  params.cursorImportance = after.importance;
+  params.cursorUpdatedAt = after.updatedAt;
+  params.cursorId = after.id;
+  clauses.push(`(
+    ${statusRank} > @cursorStatusRank
+    or (${statusRank} = @cursorStatusRank and (
+      ${importance} < @cursorImportance
+      or (${importance} = @cursorImportance and (
+        ${updatedAt} < @cursorUpdatedAt
+        or (${updatedAt} = @cursorUpdatedAt and ${id} > @cursorId)
+      ))
+    ))
+  )`);
+}
+
+function appendMemoryListFilters(clauses: string[], params: Record<string, unknown>, filters: MemoryListFilters, alias = ""): void {
+  if (filters.status && filters.status !== "any") {
+    clauses.push(`${memoryColumn(alias, "status")} = @status`);
+    params.status = filters.status;
+  }
+
+  if (filters.scopePath) {
+    clauses.push(`${memoryColumn(alias, "scope_path")} = @scopePath`);
+    params.scopePath = filters.scopePath;
+  }
+
+  if (filters.kind) {
+    clauses.push(`${memoryColumn(alias, "kind")} = @kind`);
+    params.kind = filters.kind;
+  }
+
+  if (filters.query?.trim()) {
+    clauses.push(`
+      lower(
+        coalesce(${memoryColumn(alias, "title")}, '') || ' ' || ${memoryColumn(alias, "body")} || ' ' || ${memoryColumn(alias, "scope_path")} || ' ' || ${memoryColumn(alias, "kind")} || ' ' ||
+        coalesce(${memoryColumn(alias, "source_type")}, '') || ' ' || coalesce(${memoryColumn(alias, "source_ref")}, '')
+      ) like @query escape '\\'
+    `);
+    params.query = `%${escapeLike(filters.query.trim().toLowerCase())}%`;
+  }
 }
 
 function normalizeDuplicateText(value: string | undefined): string {
@@ -913,36 +1058,17 @@ export class PortiaDatabase {
       .map((candidate) => candidate.memory);
   }
 
-  listMemories(filters: MemoryListFilters = {}): MemoryRecord[] {
+  listMemoryPage(filters: MemoryListFilters = {}): MemoryListResult {
+    const limit = clampBrowseLimit(filters.limit, 30);
+    const fingerprint = listCursorFingerprint(filters);
+    const after = filters.cursor ? decodeListCursor(filters.cursor, fingerprint).after : undefined;
     const clauses: string[] = [];
     const params: Record<string, unknown> = {
-      limit: clampLimit(filters.limit, 20),
+      limit: limit + 1,
     };
 
-    if (filters.status && filters.status !== "any") {
-      clauses.push("status = @status");
-      params.status = filters.status;
-    }
-
-    if (filters.scopePath) {
-      clauses.push("scope_path = @scopePath");
-      params.scopePath = filters.scopePath;
-    }
-
-    if (filters.kind) {
-      clauses.push("kind = @kind");
-      params.kind = filters.kind;
-    }
-
-    if (filters.query?.trim()) {
-      clauses.push(`
-        lower(
-          coalesce(title, '') || ' ' || body || ' ' || scope_path || ' ' || kind || ' ' ||
-          coalesce(source_type, '') || ' ' || coalesce(source_ref, '')
-        ) like @query escape '\\'
-      `);
-      params.query = `%${escapeLike(filters.query.trim().toLowerCase())}%`;
-    }
+    appendMemoryListFilters(clauses, params, filters);
+    if (after) appendListCursorClause(clauses, params, after);
 
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     const rows = this.db.prepare(`
@@ -952,7 +1078,23 @@ export class PortiaDatabase {
       limit @limit
     `).all(params) as MemoryRow[];
 
-    return rows.map(toMemory);
+    const memories = rows.map(toMemory);
+    const hasMore = memories.length > limit;
+    const pageMemories = hasMore ? memories.slice(0, limit) : memories;
+    const lastMemory = pageMemories.at(-1);
+
+    return {
+      memories: pageMemories,
+      page: {
+        limit,
+        hasMore,
+        nextCursor: hasMore && lastMemory ? encodeNextListCursor(fingerprint, lastMemory) : undefined,
+      },
+    };
+  }
+
+  listMemories(filters: MemoryListFilters = {}): MemoryRecord[] {
+    return this.listMemoryPage(filters).memories;
   }
 
   searchMemories(query: string, filters: MemoryListFilters = {}): MemoryRecord[] {
