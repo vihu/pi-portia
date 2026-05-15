@@ -1,7 +1,16 @@
-import type { PortiaSearchMatchMode } from "./types.ts";
+import { createHash } from "node:crypto";
+import type {
+  MemoryListStatus,
+  MemorySearchFilters,
+  PortiaSearchMatchMode,
+  PortiaSearchMatchType,
+  PortiaSearchOrderBy,
+  PortiaSearchScopeMode,
+} from "./types.ts";
 
 export const MAX_SEARCH_QUERY_LENGTH = 500;
 export const MAX_SEARCH_TERMS_LENGTH = 2_000;
+export const SEARCH_CURSOR_TYPE = "portia_search";
 
 export type SafeFtsQueryIssue = "empty" | "too_long";
 
@@ -35,6 +44,35 @@ export interface SearchTermsInput {
   sourceRef?: string | null;
 }
 
+export interface SearchCursorAfter {
+  matchType: PortiaSearchMatchType;
+  id: string;
+  score?: number;
+  updatedAt?: string;
+  importance?: number;
+}
+
+export interface SearchCursorPayload {
+  v: 1;
+  type: typeof SEARCH_CURSOR_TYPE;
+  fingerprint: string;
+  orderBy: PortiaSearchOrderBy;
+  after: SearchCursorAfter;
+}
+
+interface SearchCursorFingerprintInput {
+  ftsQuery: string;
+  rawQuery?: string;
+  terms?: string[];
+  status?: MemoryListStatus;
+  scopePath?: string;
+  scopeMode?: PortiaSearchScopeMode;
+  kind?: string;
+  orderBy?: PortiaSearchOrderBy;
+  matchMode?: PortiaSearchMatchMode;
+  includeSubstringFallback?: boolean;
+}
+
 function pushTerm(terms: string[], term: string): void {
   const trimmed = term.trim();
   if (trimmed) terms.push(trimmed);
@@ -52,6 +90,74 @@ function splitCamelCaseToken(token: string): string[] {
 function addSearchTerm(terms: Set<string>, value: string): void {
   const normalized = value.toLowerCase().trim();
   if (normalized.length >= 2) terms.add(normalized);
+}
+
+function normalizeFingerprintInput(input: SearchCursorFingerprintInput): SearchCursorFingerprintInput {
+  return {
+    ftsQuery: input.ftsQuery.trim(),
+    rawQuery: input.rawQuery?.trim() || undefined,
+    terms: input.terms?.map((term) => term.trim()).filter(Boolean) ?? [],
+    status: input.status ?? "active",
+    scopePath: input.scopePath ?? undefined,
+    scopeMode: input.scopeMode ?? "subtree",
+    kind: input.kind ?? undefined,
+    orderBy: input.orderBy ?? "relevance",
+    matchMode: input.matchMode ?? "all",
+    includeSubstringFallback: input.includeSubstringFallback ?? true,
+  };
+}
+
+export function searchCursorFingerprint(input: MemorySearchFilters): string {
+  const normalized = normalizeFingerprintInput({
+    ftsQuery: input.ftsQuery,
+    rawQuery: input.rawQuery,
+    terms: input.terms,
+    status: input.status,
+    scopePath: input.scopePath,
+    scopeMode: input.scopeMode,
+    kind: input.kind,
+    orderBy: input.orderBy,
+    matchMode: input.matchMode,
+    includeSubstringFallback: input.includeSubstringFallback,
+  });
+
+  return createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("base64url")
+    .slice(0, 24);
+}
+
+function isSearchCursorAfter(value: unknown): value is SearchCursorAfter {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as SearchCursorAfter;
+  return (candidate.matchType === "fts" || candidate.matchType === "substring") && typeof candidate.id === "string" && candidate.id.length > 0;
+}
+
+export function encodeSearchCursor(payload: SearchCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url");
+}
+
+export function decodeSearchCursor(cursor: string, expectedFingerprint: string, expectedOrderBy: PortiaSearchOrderBy): SearchCursorPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+  } catch {
+    throw new Error("Invalid Portia search cursor: cursor is not valid encoded JSON.");
+  }
+
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid Portia search cursor: cursor payload is not an object.");
+  const payload = parsed as SearchCursorPayload;
+  if (payload.v !== 1 || payload.type !== SEARCH_CURSOR_TYPE || !isSearchCursorAfter(payload.after)) {
+    throw new Error("Invalid Portia search cursor: unsupported cursor payload.");
+  }
+  if (payload.fingerprint !== expectedFingerprint) {
+    throw new Error("Invalid Portia search cursor: cursor does not match the current query and filters.");
+  }
+  if (payload.orderBy !== expectedOrderBy) {
+    throw new Error("Invalid Portia search cursor: cursor order does not match the current search order.");
+  }
+
+  return payload;
 }
 
 export function buildSearchTerms(input: SearchTermsInput): string {

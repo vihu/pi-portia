@@ -393,6 +393,128 @@ test("searchMemoryHits applies weighted FTS filters and substring fallback", () 
   }
 });
 
+test("searchMemoryPage paginates with opaque cursors", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  function buildFilters(overrides = {}) {
+    const built = buildSafeFtsQuery("cursor pagination target");
+    assert.equal(built.ok, true);
+    if (!built.ok) throw new Error("failed to build fixture query");
+    return {
+      ftsQuery: built.query.expression,
+      rawQuery: built.query.rawQuery,
+      terms: built.query.terms,
+      matchMode: built.query.matchMode,
+      orderBy: "importance",
+      limit: 2,
+      ...overrides,
+    };
+  }
+
+  try {
+    for (let index = 1; index <= 5; index += 1) {
+      db.createMemory({
+        scopePath: "src/search",
+        kind: "gotcha",
+        title: `Cursor fixture ${index}`,
+        body: "cursor pagination target",
+        importance: index,
+        confidence: 100,
+      });
+    }
+
+    const filters = buildFilters();
+    const firstPage = db.searchMemoryPage(filters);
+    assert.deepEqual(firstPage.hits.map((hit) => hit.memory.importance), [5, 4]);
+    assert.equal(firstPage.page.limit, 2);
+    assert.equal(firstPage.page.hasMore, true);
+    assert.equal(typeof firstPage.page.nextCursor, "string");
+
+    const secondPage = db.searchMemoryPage({ ...filters, cursor: firstPage.page.nextCursor });
+    assert.deepEqual(secondPage.hits.map((hit) => hit.memory.importance), [3, 2]);
+    assert.equal(secondPage.page.hasMore, true);
+    assert.equal(new Set(firstPage.hits.map((hit) => hit.memory.id)).size, firstPage.hits.length);
+    assert.equal(firstPage.hits.some((hit) => secondPage.hits.some((nextHit) => nextHit.memory.id === hit.memory.id)), false);
+
+    const thirdPage = db.searchMemoryPage({ ...filters, cursor: secondPage.page.nextCursor });
+    assert.deepEqual(thirdPage.hits.map((hit) => hit.memory.importance), [1]);
+    assert.equal(thirdPage.page.hasMore, false);
+    assert.equal(thirdPage.page.nextCursor, undefined);
+
+    for (const orderBy of ["relevance", "updated"]) {
+      const orderedFilters = buildFilters({ orderBy });
+      const orderedFirstPage = db.searchMemoryPage(orderedFilters);
+      const orderedSecondPage = db.searchMemoryPage({ ...orderedFilters, cursor: orderedFirstPage.page.nextCursor });
+      assert.equal(orderedFirstPage.hits.length, 2);
+      assert.equal(orderedSecondPage.hits.length, 2);
+      assert.equal(orderedFirstPage.hits.some((hit) => orderedSecondPage.hits.some((nextHit) => nextHit.memory.id === hit.memory.id)), false, orderBy);
+    }
+
+    assert.throws(() => db.searchMemoryPage({ ...filters, cursor: "not-a-valid-cursor" }), /Invalid Portia search cursor/);
+    assert.throws(() => db.searchMemoryPage({ ...filters, kind: "decision", cursor: firstPage.page.nextCursor }), /does not match the current query and filters/);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("searchMemoryPage does not duplicate FTS hits as substring fallback", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    for (let index = 1; index <= 3; index += 1) {
+      db.createMemory({
+        scopePath: "src/search",
+        kind: "gotcha",
+        title: `FTS fixture ${index}`,
+        body: "token alpha",
+        importance: 5,
+        confidence: 100,
+      });
+      db.createMemory({
+        scopePath: "src/search",
+        kind: "gotcha",
+        title: `Fallback fixture ${index}`,
+        body: "maxSenseResults beta",
+        importance: 5,
+        confidence: 100,
+      });
+    }
+
+    const built = buildSafeFtsQuery("token SenseRes", { matchMode: "any" });
+    assert.equal(built.ok, true);
+    if (!built.ok) throw new Error("failed to build fixture query");
+
+    const filters = {
+      ftsQuery: built.query.expression,
+      rawQuery: built.query.rawQuery,
+      terms: built.query.terms,
+      matchMode: built.query.matchMode,
+      orderBy: "relevance",
+      limit: 2,
+    };
+    const allHits = [];
+    let cursor;
+    for (let page = 0; page < 10; page += 1) {
+      const result = db.searchMemoryPage({ ...filters, cursor });
+      allHits.push(...result.hits);
+      cursor = result.page.nextCursor;
+      if (!cursor) break;
+    }
+
+    assert.equal(allHits.length, 6);
+    assert.equal(new Set(allHits.map((hit) => hit.memory.id)).size, 6);
+    assert.deepEqual(allHits.map((hit) => hit.matchType), ["fts", "fts", "fts", "substring", "substring", "substring"]);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("senseMemories ranks proximity, dependency, and FTS memories", () => {
   const project = tempProject();
   const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");

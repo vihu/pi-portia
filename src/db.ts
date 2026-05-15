@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
-import { buildSearchTerms } from "./search.ts";
+import { buildSearchTerms, decodeSearchCursor, encodeSearchCursor, searchCursorFingerprint } from "./search.ts";
+import type { SearchCursorAfter, SearchCursorPayload } from "./search.ts";
 
 type DatabaseConnection = InstanceType<typeof Database>;
 import type {
@@ -18,6 +19,7 @@ import type {
   MemoryPheromoneSummary,
   MemoryRecord,
   MemorySearchFilters,
+  MemorySearchResult,
   MemoryTraceEvent,
   PortiaSearchHit,
   PortiaSearchOrderBy,
@@ -288,7 +290,7 @@ function memorySearchOrderSql(orderBy: PortiaSearchOrderBy, alias = "m", relevan
 
   if (orderBy === "updated") return `${updatedAt} desc, ${id} asc`;
   if (orderBy === "importance") return `${importance} desc, ${updatedAt} desc, ${id} asc`;
-  return `${relevanceColumn} asc, ${importance} desc, ${updatedAt} desc, ${id} asc`;
+  return `${relevanceColumn} asc, ${id} asc`;
 }
 
 function compareSearchHits(orderBy: PortiaSearchOrderBy, a: PortiaSearchHit, b: PortiaSearchHit): number {
@@ -300,9 +302,68 @@ function compareSearchHits(orderBy: PortiaSearchOrderBy, a: PortiaSearchHit, b: 
   }
 
   return (a.score ?? Number.POSITIVE_INFINITY) - (b.score ?? Number.POSITIVE_INFINITY)
-    || b.memory.importance - a.memory.importance
-    || b.memory.updatedAt.localeCompare(a.memory.updatedAt)
     || a.memory.id.localeCompare(b.memory.id);
+}
+
+function requireCursorNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`Invalid Portia search cursor: missing ${label}.`);
+  return value;
+}
+
+function requireCursorString(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value) throw new Error(`Invalid Portia search cursor: missing ${label}.`);
+  return value;
+}
+
+function appendSearchCursorClause(
+  clauses: string[],
+  params: Record<string, unknown>,
+  after: SearchCursorAfter,
+  orderBy: PortiaSearchOrderBy | "fallbackRelevance",
+  alias = "",
+): void {
+  const id = memoryColumn(alias, "id");
+  const updatedAt = memoryColumn(alias, "updated_at");
+  const importance = memoryColumn(alias, "importance");
+  params.cursorId = after.id;
+
+  if (orderBy === "relevance") {
+    const score = memoryColumn(alias, "score");
+    params.cursorScore = requireCursorNumber(after.score, "relevance score");
+    clauses.push(`(${score} > @cursorScore or (${score} = @cursorScore and ${id} > @cursorId))`);
+    return;
+  }
+
+  if (orderBy === "updated") {
+    params.cursorUpdatedAt = requireCursorString(after.updatedAt, "updated timestamp");
+    clauses.push(`(${updatedAt} < @cursorUpdatedAt or (${updatedAt} = @cursorUpdatedAt and ${id} > @cursorId))`);
+    return;
+  }
+
+  params.cursorImportance = requireCursorNumber(after.importance, "importance");
+  params.cursorUpdatedAt = requireCursorString(after.updatedAt, "updated timestamp");
+  clauses.push(`(${importance} < @cursorImportance or (${importance} = @cursorImportance and (${updatedAt} < @cursorUpdatedAt or (${updatedAt} = @cursorUpdatedAt and ${id} > @cursorId))))`);
+}
+
+function cursorAfterHit(hit: PortiaSearchHit): SearchCursorAfter {
+  return {
+    matchType: hit.matchType,
+    id: hit.memory.id,
+    score: hit.score,
+    updatedAt: hit.memory.updatedAt,
+    importance: hit.memory.importance,
+  };
+}
+
+function encodeNextSearchCursor(fingerprint: string, orderBy: PortiaSearchOrderBy, hit: PortiaSearchHit): string {
+  const payload: SearchCursorPayload = {
+    v: 1,
+    type: "portia_search",
+    fingerprint,
+    orderBy,
+    after: cursorAfterHit(hit),
+  };
+  return encodeSearchCursor(payload);
 }
 
 function memorySelectSql(): string {
@@ -1240,46 +1301,78 @@ export class PortiaDatabase {
     return rows.map(toMemory);
   }
 
-  searchMemoryHits(filters: MemorySearchFilters): PortiaSearchHit[] {
+  searchMemoryPage(filters: MemorySearchFilters): MemorySearchResult {
     const ftsQuery = filters.ftsQuery.trim();
-    if (!ftsQuery) return [];
-
     const limit = clampSearchLimit(filters.limit, 30);
+    if (!ftsQuery) return { hits: [], page: { limit, hasMore: false } };
+
     const orderBy = filters.orderBy ?? "relevance";
     const includeSubstringFallback = filters.includeSubstringFallback ?? true;
-    const ftsClauses = ["memory_fts match @ftsQuery"];
-    const ftsParams: Record<string, unknown> = { ftsQuery, limit };
-    appendMemorySearchFilters(ftsClauses, ftsParams, filters, "m");
+    const fetchLimit = limit + 1;
+    const fingerprint = searchCursorFingerprint(filters);
+    const cursor = filters.cursor ? decodeSearchCursor(filters.cursor, fingerprint, orderBy) : undefined;
+    const ftsHits: PortiaSearchHit[] = [];
 
-    const ftsRows = this.db.prepare(`
-      select m.rowid, m.id, m.scope_path, m.kind, m.title, m.body, m.status, m.importance, m.confidence,
-             m.created_at, m.updated_at, m.created_by, m.supersedes_id, m.source_type, m.source_ref,
-             bm25(memory_fts, 8.0, 1.0, 4.0, 2.0, 1.5, 3.0, 6.0) as score,
-             snippet(memory_fts, -1, '[', ']', '…', 24) as snippet
-      from memory_fts
-      join memories m on memory_fts.rowid = m.rowid
-      where ${ftsClauses.join(" and ")}
-      order by ${memorySearchOrderSql(orderBy, "m")}
-      limit @limit
-    `).all(ftsParams) as SearchFtsRow[];
+    if (!(orderBy === "relevance" && cursor?.after.matchType === "substring")) {
+      const ftsClauses = ["memory_fts match @ftsQuery"];
+      const ftsOuterClauses: string[] = [];
+      const ftsParams: Record<string, unknown> = { ftsQuery, limit: fetchLimit };
+      appendMemorySearchFilters(ftsClauses, ftsParams, filters, "m");
 
-    const ftsHits: PortiaSearchHit[] = ftsRows.map((row) => ({
-      memory: toMemory(row),
-      matchType: "fts",
-      score: row.score,
-      snippet: row.snippet ?? undefined,
-    }));
+      if (cursor) {
+        if (orderBy === "relevance") appendSearchCursorClause(ftsOuterClauses, ftsParams, cursor.after, "relevance");
+        else appendSearchCursorClause(ftsOuterClauses, ftsParams, cursor.after, orderBy);
+      }
+
+      const ftsOuterWhere = ftsOuterClauses.length > 0 ? `where ${ftsOuterClauses.join(" and ")}` : "";
+      const ftsRows = this.db.prepare(`
+        with ranked as (
+          select m.rowid, m.id, m.scope_path, m.kind, m.title, m.body, m.status, m.importance, m.confidence,
+                 m.created_at, m.updated_at, m.created_by, m.supersedes_id, m.source_type, m.source_ref,
+                 bm25(memory_fts, 8.0, 1.0, 4.0, 2.0, 1.5, 3.0, 6.0) as score,
+                 snippet(memory_fts, -1, '[', ']', '…', 24) as snippet
+          from memory_fts
+          join memories m on memory_fts.rowid = m.rowid
+          where ${ftsClauses.join(" and ")}
+        )
+        select rowid, id, scope_path, kind, title, body, status, importance, confidence,
+               created_at, updated_at, created_by, supersedes_id, source_type, source_ref,
+               score, snippet
+        from ranked
+        ${ftsOuterWhere}
+        order by ${memorySearchOrderSql(orderBy, "")}
+        limit @limit
+      `).all(ftsParams) as SearchFtsRow[];
+
+      ftsHits.push(...ftsRows.map((row) => ({
+        memory: toMemory(row),
+        matchType: "fts" as const,
+        score: row.score,
+        snippet: row.snippet ?? undefined,
+      })));
+    }
 
     const hitsById = new Map<string, PortiaSearchHit>(ftsHits.map((hit) => [hit.memory.id, hit]));
     const fallbackHits: PortiaSearchHit[] = [];
+    const fallbackFetchLimit = orderBy === "relevance" ? Math.max(0, fetchLimit - ftsHits.length) : fetchLimit;
 
-    if (includeSubstringFallback) {
+    if (includeSubstringFallback && fallbackFetchLimit > 0) {
       const fallbackClauses: string[] = [];
-      const fallbackParams: Record<string, unknown> = { limit };
+      const fallbackParams: Record<string, unknown> = { ftsQuery, limit: fallbackFetchLimit };
       appendMemorySearchFilters(fallbackClauses, fallbackParams, filters, "m");
       const hasSubstringQuery = appendSubstringSearchFilter(fallbackClauses, fallbackParams, filters, "m");
 
       if (hasSubstringQuery) {
+        fallbackClauses.push("m.rowid not in (select rowid from memory_fts where memory_fts match @ftsQuery)");
+
+        if (cursor) {
+          if (orderBy === "relevance") {
+            if (cursor.after.matchType === "substring") appendSearchCursorClause(fallbackClauses, fallbackParams, cursor.after, "fallbackRelevance", "m");
+          } else {
+            appendSearchCursorClause(fallbackClauses, fallbackParams, cursor.after, orderBy, "m");
+          }
+        }
+
         const excludedIds = [...hitsById.keys()];
         if (excludedIds.length > 0) {
           const excludedPlaceholders = excludedIds.map((id, index) => {
@@ -1316,8 +1409,23 @@ export class PortiaDatabase {
     const combined = orderBy === "relevance"
       ? [...ftsHits, ...fallbackHits]
       : [...hitsById.values()].sort((a, b) => compareSearchHits(orderBy, a, b));
+    const hits = combined.slice(0, limit);
+    const hasMore = combined.length > limit;
+    const lastHit = hits.at(-1);
+    const nextCursor = hasMore && lastHit ? encodeNextSearchCursor(fingerprint, orderBy, lastHit) : undefined;
 
-    return combined.slice(0, limit);
+    return {
+      hits,
+      page: {
+        limit,
+        hasMore,
+        nextCursor,
+      },
+    };
+  }
+
+  searchMemoryHits(filters: MemorySearchFilters): PortiaSearchHit[] {
+    return this.searchMemoryPage(filters).hits;
   }
 
   searchActiveMemories(ftsQuery: string, limit: number): Array<MemoryRecord & { ftsScore: number }> {

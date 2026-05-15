@@ -337,6 +337,12 @@ export interface MemorySearchFilters {
   matchMode?: PortiaSearchMatchMode;
   includeSubstringFallback?: boolean;
   limit?: number;
+  cursor?: string;
+}
+
+export interface MemorySearchResult {
+  hits: PortiaSearchHit[];
+  page: PortiaSearchPage;
 }
 
 export interface PortiaInspectInput {
