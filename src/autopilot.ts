@@ -120,6 +120,7 @@ export function renderAutopilotGuidance(settings: PortiaSettings): string | unde
   lines.push("");
   lines.push("Portia is persistent project memory. Treat Portia memories as pointers, not ground truth.");
   lines.push("- Before non-trivial work in unfamiliar project areas, use `portia_sense` with the relevant path/query.");
+  lines.push("- Use `portia_search` for explicit keyword/history lookup when you need broader recall than the bounded context pack.");
 
   if (settings.autoRecordGuidance) {
     lines.push("- After verified durable project-specific findings, use `portia_record` for decisions, gotchas, invariants, pointers, patterns, purpose, or plans.");

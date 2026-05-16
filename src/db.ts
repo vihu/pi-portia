@@ -22,6 +22,8 @@ import type {
   MemorySearchFilters,
   MemorySearchResult,
   MemoryTraceEvent,
+  PortiaDoctorCheck,
+  PortiaReindexStats,
   PortiaSearchHit,
   PortiaSearchOrderBy,
   PortiaStats,
@@ -34,8 +36,64 @@ const SCHEMA_VERSION = 3;
 const MAX_BROWSE_LIMIT = 500;
 const MAX_SEARCH_LIMIT = MAX_BROWSE_LIMIT;
 const LIST_CURSOR_TYPE = "portia_list";
+const SNIPPET_START_MARKER = "\u0001";
+const SNIPPET_END_MARKER = "\u0002";
 const MIN_PHEROMONE_STRENGTH = -5;
 const MAX_PHEROMONE_STRENGTH = 20;
+const EXPECTED_MEMORY_FTS_COLUMNS = ["title", "body", "scope_path", "kind", "source_type", "source_ref", "search_terms"] as const;
+const EXPECTED_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  portia_meta: ["key", "value"],
+  memories: [
+    "id",
+    "scope_path",
+    "kind",
+    "title",
+    "body",
+    "status",
+    "importance",
+    "confidence",
+    "created_at",
+    "updated_at",
+    "created_by",
+    "supersedes_id",
+    "source_type",
+    "source_ref",
+    "search_terms",
+  ],
+  memory_events: ["id", "memory_id", "event_type", "payload_json", "created_at", "created_by"],
+  memory_pheromones: [
+    "memory_id",
+    "strength",
+    "exposed_count",
+    "followed_count",
+    "ignored_count",
+    "success_count",
+    "failure_count",
+    "last_exposed_at",
+    "last_followed_at",
+    "last_ignored_at",
+    "last_success_at",
+    "last_failure_at",
+    "last_decayed_at",
+    "updated_at",
+  ],
+  memory_trace_events: [
+    "id",
+    "memory_id",
+    "event_type",
+    "scope_path",
+    "tool_name",
+    "tool_call_id",
+    "session_file",
+    "turn_id",
+    "weight",
+    "payload_json",
+    "created_at",
+  ],
+  memory_edges: ["from_id", "to_id", "relation"],
+  memory_fts: EXPECTED_MEMORY_FTS_COLUMNS,
+};
+const EXPECTED_MEMORY_FTS_TRIGGERS = ["memories_ai", "memories_ad", "memories_au"] as const;
 
 interface MemoryRow {
   rowid: number;
@@ -116,7 +174,12 @@ interface FtsRow extends MemoryRow {
 }
 
 interface SearchFtsRow extends FtsRow {
-  snippet: string | null;
+  title_snippet: string | null;
+  body_snippet: string | null;
+  scope_snippet: string | null;
+  kind_snippet: string | null;
+  source_type_snippet: string | null;
+  source_ref_snippet: string | null;
 }
 
 interface ListCursorAfter {
@@ -325,6 +388,28 @@ function compareSearchHits(orderBy: PortiaSearchOrderBy, a: PortiaSearchHit, b: 
 
   return (a.score ?? Number.POSITIVE_INFINITY) - (b.score ?? Number.POSITIVE_INFINITY)
     || a.memory.id.localeCompare(b.memory.id);
+}
+
+function formatVisibleSearchSnippet(snippet: string | null | undefined): string | undefined {
+  if (!snippet?.includes(SNIPPET_START_MARKER)) return undefined;
+  return snippet
+    .replaceAll(SNIPPET_START_MARKER, "[")
+    .replaceAll(SNIPPET_END_MARKER, "]");
+}
+
+function chooseVisibleSearchSnippet(row: SearchFtsRow): string | undefined {
+  for (const snippet of [
+    row.title_snippet,
+    row.body_snippet,
+    row.scope_snippet,
+    row.kind_snippet,
+    row.source_type_snippet,
+    row.source_ref_snippet,
+  ]) {
+    const formatted = formatVisibleSearchSnippet(snippet);
+    if (formatted) return formatted;
+  }
+  return undefined;
 }
 
 function requireCursorNumber(value: unknown, label: string): number {
@@ -585,13 +670,12 @@ function memoryFtsNeedsRebuild(db: DatabaseConnection): boolean {
   const exists = (db.prepare("select count(*) as count from sqlite_master where type = 'table' and name = 'memory_fts'").get() as CountRow | undefined)?.count ?? 0;
   if (exists === 0) return true;
 
-  const expectedColumns = ["title", "body", "scope_path", "kind", "source_type", "source_ref", "search_terms"];
   const existingColumns = tableColumns(db, "memory_fts");
-  return expectedColumns.join("|") !== existingColumns.join("|");
+  return EXPECTED_MEMORY_FTS_COLUMNS.join("|") !== existingColumns.join("|");
 }
 
 function memoryFtsTriggersNeedRebuild(db: DatabaseConnection): boolean {
-  const expectedNames = new Set(["memories_ai", "memories_ad", "memories_au"]);
+  const expectedNames = new Set<string>(EXPECTED_MEMORY_FTS_TRIGGERS);
   const rows = db.prepare(`
     select name, sql
     from sqlite_master
@@ -606,6 +690,14 @@ function memoryFtsTriggersNeedRebuild(db: DatabaseConnection): boolean {
   }
 
   return expectedNames.size > 0;
+}
+
+function doctorCheck(name: string, status: PortiaDoctorCheck["status"], message: string, details?: Record<string, unknown>): PortiaDoctorCheck {
+  return details ? { name, status, message, details } : { name, status, message };
+}
+
+function countSql(db: DatabaseConnection, sql: string): number {
+  return (db.prepare(sql).get() as CountRow | undefined)?.count ?? 0;
 }
 
 function dropMemoryFtsTriggers(db: DatabaseConnection): void {
@@ -662,6 +754,10 @@ function backfillSearchTerms(db: DatabaseConnection): number {
     order by rowid asc
   `).all() as SearchTermsBackfillRow[];
 
+  return updateSearchTerms(db, rows);
+}
+
+function updateSearchTerms(db: DatabaseConnection, rows: SearchTermsBackfillRow[]): number {
   if (rows.length === 0) return 0;
 
   const update = db.prepare("update memories set search_terms = @searchTerms where rowid = @rowid");
@@ -682,6 +778,30 @@ function backfillSearchTerms(db: DatabaseConnection): number {
   }
 
   return changed;
+}
+
+function recomputeAllSearchTerms(db: DatabaseConnection): number {
+  const rows = db.prepare(`
+    select rowid, scope_path, kind, title, body, source_type, source_ref
+    from memories
+    order by rowid asc
+  `).all() as SearchTermsBackfillRow[];
+
+  return updateSearchTerms(db, rows);
+}
+
+function ftsDocsizeCount(db: DatabaseConnection): number | undefined {
+  const exists = countSql(db, "select count(*) as count from sqlite_master where type = 'table' and name = 'memory_fts_docsize'") > 0;
+  if (!exists) return undefined;
+  return countSql(db, "select count(*) as count from memory_fts_docsize");
+}
+
+function reindexStats(db: DatabaseConnection): PortiaReindexStats {
+  return {
+    memoryCount: countSql(db, "select count(*) as count from memories"),
+    nullSearchTerms: countSql(db, "select count(*) as count from memories where search_terms is null"),
+    ftsRows: ftsDocsizeCount(db),
+  };
 }
 
 function rebuildMemoryFts(db: DatabaseConnection): void {
@@ -1383,6 +1503,166 @@ export class PortiaDatabase {
     return result.changes ?? 0;
   }
 
+  reindex(input: { dryRun?: boolean } = {}): { before: PortiaReindexStats; after?: PortiaReindexStats; recomputedSearchTerms: number; rebuiltFts: boolean; warnings: string[] } {
+    const before = reindexStats(this.db);
+    const warnings: string[] = [];
+
+    if (input.dryRun) {
+      if (before.ftsRows !== undefined && before.ftsRows !== before.memoryCount) {
+        warnings.push(`FTS row count ${before.ftsRows} does not match memory count ${before.memoryCount}.`);
+      }
+      if (before.nullSearchTerms > 0) warnings.push(`${before.nullSearchTerms} memories have null search_terms.`);
+      return { before, recomputedSearchTerms: 0, rebuiltFts: false, warnings };
+    }
+
+    const run = this.db.transaction(() => {
+      ensureSearchTermsColumn(this.db);
+      ensureMemoryFts(this.db);
+      const recomputedSearchTerms = recomputeAllSearchTerms(this.db);
+      rebuildMemoryFts(this.db);
+      const after = reindexStats(this.db);
+      return { recomputedSearchTerms, after };
+    });
+
+    const { recomputedSearchTerms, after } = run();
+    if (after.ftsRows !== undefined && after.ftsRows !== after.memoryCount) {
+      warnings.push(`FTS row count ${after.ftsRows} does not match memory count ${after.memoryCount} after rebuild.`);
+    }
+    if (after.nullSearchTerms > 0) warnings.push(`${after.nullSearchTerms} memories still have null search_terms after recompute.`);
+
+    return { before, after, recomputedSearchTerms, rebuiltFts: true, warnings };
+  }
+
+  doctor(): { schemaVersion: number; checks: PortiaDoctorCheck[] } {
+    const checks: PortiaDoctorCheck[] = [];
+    const hasPortiaMeta = countSql(this.db, "select count(*) as count from sqlite_master where type = 'table' and name = 'portia_meta'") > 0;
+    const schemaVersion = hasPortiaMeta
+      ? Number(
+        (this.db.prepare("select value from portia_meta where key = 'schema_version'").get() as { value?: string } | undefined)
+          ?.value ?? 0,
+      )
+      : 0;
+
+    checks.push(schemaVersion === SCHEMA_VERSION
+      ? doctorCheck("schema_version", "ok", `Schema version ${schemaVersion} is current.`)
+      : doctorCheck("schema_version", "error", `Schema version ${schemaVersion || "unknown"} does not match expected ${SCHEMA_VERSION}.`, {
+        expected: SCHEMA_VERSION,
+        actual: schemaVersion || undefined,
+      }));
+
+    const tableNames = new Set(
+      (this.db.prepare("select name from sqlite_master where type = 'table'").all() as TableInfoRow[]).map((row) => row.name),
+    );
+    const expectedTables = Object.keys(EXPECTED_TABLE_COLUMNS);
+    const missingTables = expectedTables.filter((table) => !tableNames.has(table));
+    checks.push(missingTables.length === 0
+      ? doctorCheck("tables", "ok", `All ${expectedTables.length} expected tables exist.`)
+      : doctorCheck("tables", "error", `Missing expected tables: ${missingTables.join(", ")}.`, { missingTables }));
+
+    for (const [tableName, expectedColumns] of Object.entries(EXPECTED_TABLE_COLUMNS)) {
+      if (!tableNames.has(tableName)) continue;
+      const actualColumns = tableColumns(this.db, tableName);
+      const missingColumns = expectedColumns.filter((column) => !actualColumns.includes(column));
+      checks.push(missingColumns.length === 0
+        ? doctorCheck(`columns:${tableName}`, "ok", `${tableName} columns are current.`)
+        : doctorCheck(`columns:${tableName}`, "error", `${tableName} is missing columns: ${missingColumns.join(", ")}.`, {
+          expectedColumns: [...expectedColumns],
+          actualColumns,
+          missingColumns,
+        }));
+    }
+
+    const ftsAvailable = tableNames.has("memory_fts");
+    checks.push(ftsAvailable
+      ? doctorCheck("fts_available", "ok", "memory_fts table is available.")
+      : doctorCheck("fts_available", "error", "memory_fts table is missing."));
+
+    if (ftsAvailable && tableNames.has("memories") && tableNames.has("memory_fts_docsize")) {
+      const memoryCount = countSql(this.db, "select count(*) as count from memories");
+      const ftsDocCount = countSql(this.db, "select count(*) as count from memory_fts_docsize");
+      const missingFtsRows = countSql(this.db, "select count(*) as count from memories m where m.rowid not in (select id from memory_fts_docsize)");
+      const orphanFtsRows = countSql(this.db, "select count(*) as count from memory_fts_docsize d where d.id not in (select rowid from memories)");
+      const consistent = memoryCount === ftsDocCount && missingFtsRows === 0 && orphanFtsRows === 0;
+      checks.push(consistent
+        ? doctorCheck("fts_row_consistency", "ok", `FTS docsize rows match ${memoryCount} memories.`)
+        : doctorCheck("fts_row_consistency", "error", "FTS index row counts do not match memories; run reindex when available.", {
+          memoryCount,
+          ftsDocCount,
+          missingFtsRows,
+          orphanFtsRows,
+        }));
+    } else if (ftsAvailable && tableNames.has("memories")) {
+      checks.push(doctorCheck("fts_row_consistency", "warning", "memory_fts_docsize shadow table is unavailable; row consistency could not be checked."));
+    }
+
+    const triggerRows = this.db.prepare(`
+      select name, sql
+      from sqlite_master
+      where type = 'trigger' and name in ('memories_ai', 'memories_ad', 'memories_au')
+    `).all() as TriggerSqlRow[];
+    const triggerNames = new Set(triggerRows.map((row) => row.name));
+    const missingTriggers = EXPECTED_MEMORY_FTS_TRIGGERS.filter((name) => !triggerNames.has(name));
+    const outdatedTriggers = triggerRows
+      .filter((row) => {
+        const sql = row.sql ?? "";
+        return !sql.includes("source_type") || !sql.includes("source_ref") || !sql.includes("search_terms");
+      })
+      .map((row) => row.name);
+    checks.push(missingTriggers.length === 0 && outdatedTriggers.length === 0
+      ? doctorCheck("fts_triggers", "ok", "FTS maintenance triggers are present and current.")
+      : doctorCheck("fts_triggers", "error", "FTS maintenance triggers are missing or outdated.", {
+        missingTriggers,
+        outdatedTriggers,
+      }));
+
+    if (tableNames.has("memories") && tableColumns(this.db, "memories").includes("search_terms")) {
+      const nullSearchTerms = countSql(this.db, "select count(*) as count from memories where search_terms is null");
+      checks.push(nullSearchTerms === 0
+        ? doctorCheck("search_terms", "ok", "All memories have generated search_terms values.")
+        : doctorCheck("search_terms", "warning", `${nullSearchTerms} memories have null search_terms; run reindex when available.`, { nullSearchTerms }));
+    }
+
+    if (tableNames.has("memory_events") && tableNames.has("memories")) {
+      const orphanedEvents = countSql(this.db, "select count(*) as count from memory_events e left join memories m on m.id = e.memory_id where m.id is null");
+      checks.push(orphanedEvents === 0
+        ? doctorCheck("orphaned_events", "ok", "No orphaned memory events found.")
+        : doctorCheck("orphaned_events", "warning", `${orphanedEvents} memory events refer to missing memories.`, { orphanedEvents }));
+    }
+
+    if (tableNames.has("memory_pheromones") && tableNames.has("memories")) {
+      const orphanedPheromones = countSql(this.db, "select count(*) as count from memory_pheromones p left join memories m on m.id = p.memory_id where m.id is null");
+      checks.push(orphanedPheromones === 0
+        ? doctorCheck("orphaned_pheromones", "ok", "No orphaned pheromone summaries found.")
+        : doctorCheck("orphaned_pheromones", "warning", `${orphanedPheromones} pheromone summaries refer to missing memories.`, { orphanedPheromones }));
+    }
+
+    if (tableNames.has("memory_trace_events") && tableNames.has("memories")) {
+      const orphanedTraceEvents = countSql(this.db, "select count(*) as count from memory_trace_events t left join memories m on m.id = t.memory_id where m.id is null");
+      checks.push(orphanedTraceEvents === 0
+        ? doctorCheck("orphaned_trace_events", "ok", "No orphaned pheromone trace events found.")
+        : doctorCheck("orphaned_trace_events", "warning", `${orphanedTraceEvents} pheromone trace events refer to missing memories.`, { orphanedTraceEvents }));
+    }
+
+    if (tableNames.has("memory_edges") && tableNames.has("memories")) {
+      const orphanedEdges = countSql(this.db, "select count(*) as count from memory_edges e left join memories fm on fm.id = e.from_id left join memories tm on tm.id = e.to_id where fm.id is null or tm.id is null");
+      checks.push(orphanedEdges === 0
+        ? doctorCheck("orphaned_edges", "ok", "No orphaned memory edges found.")
+        : doctorCheck("orphaned_edges", "warning", `${orphanedEdges} memory edges refer to missing memories.`, { orphanedEdges }));
+    }
+
+    const foreignKeyViolations = (this.db.prepare("pragma foreign_key_check").all() as unknown[]).length;
+    checks.push(foreignKeyViolations === 0
+      ? doctorCheck("foreign_keys", "ok", "SQLite foreign key check passed.")
+      : doctorCheck("foreign_keys", "error", `${foreignKeyViolations} SQLite foreign key violations found.`, { foreignKeyViolations }));
+
+    const dbPathExists = fs.existsSync(this.dbPath);
+    checks.push(dbPathExists
+      ? doctorCheck("db_path", "ok", "Database path exists.", { dbPath: this.dbPath })
+      : doctorCheck("db_path", "warning", "Database path does not exist on disk yet.", { dbPath: this.dbPath }));
+
+    return { schemaVersion, checks };
+  }
+
   getStats(): PortiaStats {
     const count = (sql: string): number => (this.db.prepare(sql).get() as CountRow | undefined)?.count ?? 0;
     const schemaVersion = Number(
@@ -1472,14 +1752,19 @@ export class PortiaDatabase {
           select m.rowid, m.id, m.scope_path, m.kind, m.title, m.body, m.status, m.importance, m.confidence,
                  m.created_at, m.updated_at, m.created_by, m.supersedes_id, m.source_type, m.source_ref,
                  bm25(memory_fts, 8.0, 1.0, 4.0, 2.0, 1.5, 3.0, 6.0) as score,
-                 snippet(memory_fts, -1, '[', ']', '…', 24) as snippet
+                 snippet(memory_fts, 0, char(1), char(2), '…', 24) as title_snippet,
+                 snippet(memory_fts, 1, char(1), char(2), '…', 24) as body_snippet,
+                 snippet(memory_fts, 2, char(1), char(2), '…', 24) as scope_snippet,
+                 snippet(memory_fts, 3, char(1), char(2), '…', 24) as kind_snippet,
+                 snippet(memory_fts, 4, char(1), char(2), '…', 24) as source_type_snippet,
+                 snippet(memory_fts, 5, char(1), char(2), '…', 24) as source_ref_snippet
           from memory_fts
           join memories m on memory_fts.rowid = m.rowid
           where ${ftsClauses.join(" and ")}
         )
         select rowid, id, scope_path, kind, title, body, status, importance, confidence,
                created_at, updated_at, created_by, supersedes_id, source_type, source_ref,
-               score, snippet
+               score, title_snippet, body_snippet, scope_snippet, kind_snippet, source_type_snippet, source_ref_snippet
         from ranked
         ${ftsOuterWhere}
         order by ${memorySearchOrderSql(orderBy, "")}
@@ -1490,7 +1775,7 @@ export class PortiaDatabase {
         memory: toMemory(row),
         matchType: "fts" as const,
         score: row.score,
-        snippet: row.snippet ?? undefined,
+        snippet: chooseVisibleSearchSnippet(row),
       })));
     }
 
@@ -1592,5 +1877,11 @@ export function openPortiaDatabase(dbPath: string): PortiaDatabase {
   db.pragma("foreign_keys = ON");
   db.pragma("journal_mode = WAL");
   runMigrations(db);
+  return new PortiaDatabase(dbPath, db);
+}
+
+export function openPortiaDatabaseReadOnly(dbPath: string): PortiaDatabase {
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  db.pragma("foreign_keys = ON");
   return new PortiaDatabase(dbPath, db);
 }
