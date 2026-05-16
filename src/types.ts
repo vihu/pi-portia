@@ -44,6 +44,10 @@ export interface PortiaSettings {
   workerWritePolicy: WritePolicy;
   effectiveWritePolicy: WritePolicy;
   maxSenseResults: number;
+  searchDefaultLimit: number;
+  searchMaxResults: number;
+  listDefaultLimit: number;
+  listMaxResults: number;
   enableDependencyScan: boolean;
   enableFts: boolean;
   enableVectors: boolean;
@@ -248,12 +252,24 @@ export interface PortiaRecordResult {
   supersedeEvent?: MemoryEvent;
 }
 
+export interface PortiaListPage {
+  limit: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
 export interface MemoryListFilters {
   status?: MemoryListStatus;
   scopePath?: string;
   kind?: MemoryKind | string;
   query?: string;
   limit?: number;
+  cursor?: string;
+}
+
+export interface MemoryListResult {
+  memories: MemoryRecord[];
+  page: PortiaListPage;
 }
 
 export interface PortiaListResult {
@@ -265,9 +281,82 @@ export interface PortiaListResult {
     kind?: MemoryKind;
     query?: string;
     limit: number;
+    cursor?: string;
   };
   memories: MemoryRecord[];
+  page: PortiaListPage;
   warnings: string[];
+}
+
+export type PortiaSearchScopeMode = "subtree" | "exact";
+export type PortiaSearchOrderBy = "relevance" | "updated" | "importance";
+export type PortiaSearchMatchMode = "all" | "any" | "phrase";
+export type PortiaSearchMatchType = "fts" | "substring";
+
+export interface PortiaSearchInput {
+  query: string;
+  status?: MemoryListStatus;
+  scopePath?: string;
+  scopeMode?: PortiaSearchScopeMode;
+  kind?: MemoryKind | string;
+  orderBy?: PortiaSearchOrderBy;
+  matchMode?: PortiaSearchMatchMode;
+  includeSubstringFallback?: boolean;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface PortiaSearchHit {
+  memory: MemoryRecord;
+  matchType: PortiaSearchMatchType;
+  score?: number;
+  snippet?: string;
+}
+
+export interface PortiaSearchPage {
+  limit: number;
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
+export interface PortiaSearchOutput {
+  projectRoot: string;
+  dbPath: string;
+  filters: {
+    query: string;
+    status: MemoryListStatus;
+    scopePath?: string;
+    scopeMode: PortiaSearchScopeMode;
+    kind?: MemoryKind;
+    orderBy: PortiaSearchOrderBy;
+    matchMode: PortiaSearchMatchMode;
+    includeSubstringFallback: boolean;
+    limit: number;
+    cursor?: string;
+  };
+  hits: PortiaSearchHit[];
+  page: PortiaSearchPage;
+  warnings: string[];
+}
+
+export interface MemorySearchFilters {
+  ftsQuery: string;
+  rawQuery?: string;
+  terms?: string[];
+  status?: MemoryListStatus;
+  scopePath?: string;
+  scopeMode?: PortiaSearchScopeMode;
+  kind?: MemoryKind | string;
+  orderBy?: PortiaSearchOrderBy;
+  matchMode?: PortiaSearchMatchMode;
+  includeSubstringFallback?: boolean;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface MemorySearchResult {
+  hits: PortiaSearchHit[];
+  page: PortiaSearchPage;
 }
 
 export interface PortiaInspectInput {

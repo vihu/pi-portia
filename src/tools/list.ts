@@ -34,7 +34,10 @@ export const PortiaListParams = Type.Object({
     description: "Optional case-insensitive query over title, body, scope, kind, and provenance.",
   })),
   limit: Type.Optional(Type.Number({
-    description: "Maximum memories to list. Defaults to 20; capped at 100.",
+    description: "Maximum memories to list. Defaults to portia.listDefaultLimit and is capped by portia.listMaxResults.",
+  })),
+  cursor: Type.Optional(Type.String({
+    description: "Opaque nextCursor from a previous portia_list page. Repeat the same filters when using it.",
   })),
 });
 
@@ -47,6 +50,7 @@ export function registerPortiaListTool(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use portia_list when you need to understand what durable Portia memories exist before recording or repairing memory.",
       "Use portia_inspect for full provenance and event history of a specific memory id.",
+      "Use nextCursor with the same filters to continue browsing additional pages.",
       "Treat listed memories as pointers; verify source files and commands before relying on them.",
     ],
     parameters: PortiaListParams,

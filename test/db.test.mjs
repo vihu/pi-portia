@@ -13,6 +13,7 @@ import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState,
 import { recordPortiaMemory } from "../src/record.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
 import { senseMemories } from "../src/retrieval.ts";
+import { buildSafeFtsQuery, buildSearchTerms, parsePlainSearchTerms, parsePortiaSearchCommandArgs, searchPortiaMemories } from "../src/search.ts";
 import { listPortiaTrails } from "../src/trails.ts";
 
 function tempProject() {
@@ -64,6 +65,10 @@ function settings(projectRoot, dbPath, overrides = {}) {
     workerWritePolicy: "readonly",
     effectiveWritePolicy: overrides.effectiveWritePolicy ?? writePolicy,
     maxSenseResults: 12,
+    searchDefaultLimit: 30,
+    searchMaxResults: 250,
+    listDefaultLimit: 30,
+    listMaxResults: 250,
     enableDependencyScan: true,
     enableFts: true,
     enableVectors: false,
@@ -96,7 +101,7 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
   const db = openPortiaDatabase(dbPath);
   try {
     const stats = db.getStats();
-    assert.equal(stats.schemaVersion, 2);
+    assert.equal(stats.schemaVersion, 3);
     assert.equal(stats.ftsAvailable, true);
     assert.equal(stats.totalMemories, 0);
   } finally {
@@ -120,6 +125,469 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
     reopened.close();
     fs.rmSync(project, { recursive: true, force: true });
   }
+});
+
+test("schema v3 migrates FTS metadata and generated search terms", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+  const legacy = new Database(dbPath);
+  legacy.exec(`
+    create table portia_meta (key text primary key, value text not null);
+    insert into portia_meta(key, value) values ('schema_version', '2');
+
+    create table memories (
+      id text primary key,
+      scope_path text not null,
+      kind text not null,
+      title text,
+      body text not null,
+      status text not null default 'active',
+      importance integer not null default 0,
+      confidence integer not null default 100,
+      created_at text not null,
+      updated_at text not null,
+      created_by text,
+      supersedes_id text references memories(id),
+      source_type text,
+      source_ref text
+    );
+
+    create virtual table memory_fts using fts5(
+      title,
+      body,
+      scope_path,
+      kind,
+      content='memories',
+      content_rowid='rowid'
+    );
+  `);
+  legacy.prepare(`
+    insert into memories (
+      id, scope_path, kind, title, body, status, importance, confidence,
+      created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+    ) values (
+      'legacy-search', 'src/config.ts', 'gotcha', 'Legacy search metadata',
+      'Changing maxSenseResults must be searchable by component words.',
+      'active', 5, 100, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
+      'test', null, 'manual', 'docs/LegacyNote.md'
+    )
+  `).run();
+  legacy.close();
+
+  const migrated = openPortiaDatabase(dbPath);
+  try {
+    assert.equal(migrated.getStats().schemaVersion, 3);
+
+    for (const rawQuery of ["max sense results", "manual", "legacy note"]) {
+      const built = buildSafeFtsQuery(rawQuery);
+      assert.equal(built.ok, true, rawQuery);
+      if (!built.ok) continue;
+      const results = migrated.searchActiveMemories(built.query.expression, 10);
+      assert.equal(results.some((memory) => memory.id === "legacy-search"), true, rawQuery);
+    }
+
+    const created = migrated.createMemory({
+      scopePath: "src/search.ts",
+      kind: "gotcha",
+      title: "Post-migration trigger fixture",
+      body: "Changing newCamelIdentifier should be searchable after migration.",
+      importance: 5,
+      confidence: 100,
+      sourceType: "test",
+      sourceRef: "docs/NewMemoryNote.md",
+    }).memory;
+
+    for (const rawQuery of ["new camel identifier", "new memory note"]) {
+      const built = buildSafeFtsQuery(rawQuery);
+      assert.equal(built.ok, true, rawQuery);
+      if (!built.ok) continue;
+      const results = migrated.searchActiveMemories(built.query.expression, 10);
+      assert.equal(results.some((memory) => memory.id === created.id), true, rawQuery);
+    }
+  } finally {
+    migrated.close();
+  }
+
+  const inspected = new Database(dbPath);
+  try {
+    const memoryColumns = inspected.prepare("pragma table_info(memories)").all().map((row) => row.name);
+    const ftsColumns = inspected.prepare("pragma table_info(memory_fts)").all().map((row) => row.name);
+    assert.equal(memoryColumns.includes("search_terms"), true);
+    assert.deepEqual(ftsColumns, ["title", "body", "scope_path", "kind", "source_type", "source_ref", "search_terms"]);
+  } finally {
+    inspected.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("safe FTS query builder quotes plain user input", () => {
+  const searchTerms = buildSearchTerms({
+    scopePath: "src/config.ts",
+    kind: "gotcha",
+    body: "Adjust maxSenseResults and SQL_ERROR handling.",
+    sourceRef: "docs/LegacyNote.md",
+  });
+  assert.match(searchTerms, /\bmax\b/);
+  assert.match(searchTerms, /\bsense\b/);
+  assert.match(searchTerms, /\bresults\b/);
+  assert.match(searchTerms, /\blegacy\b/);
+  assert.match(searchTerms, /\bnote\b/);
+
+  assert.deepEqual(parsePlainSearchTerms('alpha "beta gamma" delta'), ["alpha", "beta gamma", "delta"]);
+  assert.deepEqual(parsePlainSearchTerms('/portia-list src/config.ts foo:bar'), ["/portia-list", "src/config.ts", "foo:bar"]);
+
+  const all = buildSafeFtsQuery("alpha beta");
+  assert.equal(all.ok, true);
+  if (all.ok) assert.equal(all.query.expression, '"alpha" "beta"');
+
+  const any = buildSafeFtsQuery("alpha beta", { matchMode: "any" });
+  assert.equal(any.ok, true);
+  if (any.ok) assert.equal(any.query.expression, '"alpha" OR "beta"');
+
+  const phrase = buildSafeFtsQuery('alpha "beta"', { matchMode: "phrase" });
+  assert.equal(phrase.ok, true);
+  if (phrase.ok) assert.equal(phrase.query.expression, '"alpha ""beta"""');
+
+  const empty = buildSafeFtsQuery("   ");
+  assert.equal(empty.ok, false);
+  if (!empty.ok) assert.equal(empty.error.reason, "empty");
+
+  const tooLong = buildSafeFtsQuery("x".repeat(501));
+  assert.equal(tooLong.ok, false);
+  if (!tooLong.ok) assert.equal(tooLong.error.reason, "too_long");
+});
+
+test("safe FTS query builder prevents malformed MATCH errors for code-like literals", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+
+  insertMemory(dbPath, {
+    id: "literal-search-fixture",
+    scope_path: "src/config.ts",
+    kind: "gotcha",
+    title: "Literal /portia-list search fixture",
+    body: 'Search for -6 /portia-list src/config.ts foo:bar v1.2 "quoted" AND OR NOT without raw FTS syntax errors.',
+  });
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    for (const rawQuery of ["-6", "/portia-list", "src/config.ts", "foo:bar", "v1.2", '"quoted"', "AND OR NOT"]) {
+      const built = buildSafeFtsQuery(rawQuery);
+      assert.equal(built.ok, true, rawQuery);
+      if (!built.ok) continue;
+
+      const results = reopened.searchActiveMemories(built.query.expression, 10);
+      assert.equal(results.some((memory) => memory.id === "literal-search-fixture"), true, rawQuery);
+    }
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("searchMemoryHits applies weighted FTS filters and substring fallback", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  function runSearch(rawQuery, overrides = {}) {
+    const built = buildSafeFtsQuery(rawQuery, { matchMode: overrides.matchMode });
+    assert.equal(built.ok, true, rawQuery);
+    if (!built.ok) return [];
+    return db.searchMemoryHits({
+      ftsQuery: built.query.expression,
+      rawQuery: built.query.rawQuery,
+      terms: built.query.terms,
+      matchMode: built.query.matchMode,
+      ...overrides,
+    });
+  }
+
+  try {
+    const titleHit = db.createMemory({
+      scopePath: "src/auth",
+      kind: "decision",
+      title: "Token search policy",
+      body: "Prefer the title result when ranking weighted full-text matches.",
+      importance: 4,
+      confidence: 100,
+    }).memory;
+    const bodyHit = db.createMemory({
+      scopePath: "src/auth/session",
+      kind: "gotcha",
+      title: "Session cache",
+      body: "Token search appears only in this body field for comparison.",
+      importance: 4,
+      confidence: 100,
+    }).memory;
+    const dbHit = db.createMemory({
+      scopePath: "src/db",
+      kind: "decision",
+      title: "Database note",
+      body: "Database-specific token search behavior.",
+      importance: 4,
+      confidence: 100,
+    }).memory;
+    const staleHit = db.createMemory({
+      scopePath: "src/auth",
+      kind: "decision",
+      title: "Token search stale note",
+      body: "Inactive token search result.",
+      importance: 10,
+      confidence: 100,
+    }).memory;
+    db.updateMemoryStatus({ id: staleHit.id, status: "stale", reason: "test fixture" });
+    const fallbackHit = db.createMemory({
+      scopePath: "src/config",
+      kind: "gotcha",
+      title: "Substring fallback fixture",
+      body: "Update maxSenseResults carefully when changing retrieval limits.",
+      importance: 1,
+      confidence: 100,
+    }).memory;
+
+    const relevance = runSearch("token search", { limit: 10 });
+    assert.equal(relevance.at(0)?.memory.id, titleHit.id);
+    assert.equal(relevance.at(0)?.matchType, "fts");
+    assert.match(relevance.at(0)?.snippet ?? "", /\[/);
+    assert.equal(relevance.some((hit) => hit.memory.id === bodyHit.id), true);
+    assert.equal(relevance.some((hit) => hit.memory.id === staleHit.id), false);
+
+    const importantHit = db.createMemory({
+      scopePath: "src/auth",
+      kind: "gotcha",
+      title: "Important body-only fixture",
+      body: "Token search should sort first when explicit importance ordering is requested.",
+      importance: 9,
+      confidence: 100,
+    }).memory;
+    const byImportance = runSearch("token search", { orderBy: "importance", limit: 10 });
+    assert.equal(byImportance.at(0)?.memory.id, importantHit.id);
+
+    const anyStatus = runSearch("token search", { status: "any", limit: 10 });
+    assert.equal(anyStatus.some((hit) => hit.memory.id === staleHit.id), true);
+
+    const decisions = runSearch("token search", { kind: "decision", limit: 10 });
+    assert.equal(decisions.some((hit) => hit.memory.id === titleHit.id), true);
+    assert.equal(decisions.some((hit) => hit.memory.id === dbHit.id), true);
+    assert.equal(decisions.some((hit) => hit.memory.id === bodyHit.id), false);
+
+    const authSubtree = runSearch("token search", { scopePath: "src/auth", scopeMode: "subtree", limit: 10 });
+    assert.equal(authSubtree.some((hit) => hit.memory.id === titleHit.id), true);
+    assert.equal(authSubtree.some((hit) => hit.memory.id === bodyHit.id), true);
+    assert.equal(authSubtree.some((hit) => hit.memory.id === dbHit.id), false);
+
+    const authExact = runSearch("token search", { scopePath: "src/auth", scopeMode: "exact", limit: 10 });
+    assert.equal(authExact.some((hit) => hit.memory.id === titleHit.id), true);
+    assert.equal(authExact.some((hit) => hit.memory.id === bodyHit.id), false);
+
+    const substring = runSearch("SenseRes", { limit: 10 });
+    assert.equal(substring.some((hit) => hit.memory.id === fallbackHit.id && hit.matchType === "substring"), true);
+
+    const withoutSubstring = runSearch("SenseRes", { includeSubstringFallback: false, limit: 10 });
+    assert.equal(withoutSubstring.some((hit) => hit.memory.id === fallbackHit.id), false);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("searchMemoryPage paginates with opaque cursors", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  function buildFilters(overrides = {}) {
+    const built = buildSafeFtsQuery("cursor pagination target");
+    assert.equal(built.ok, true);
+    if (!built.ok) throw new Error("failed to build fixture query");
+    return {
+      ftsQuery: built.query.expression,
+      rawQuery: built.query.rawQuery,
+      terms: built.query.terms,
+      matchMode: built.query.matchMode,
+      orderBy: "importance",
+      limit: 2,
+      ...overrides,
+    };
+  }
+
+  try {
+    for (let index = 1; index <= 5; index += 1) {
+      db.createMemory({
+        scopePath: "src/search",
+        kind: "gotcha",
+        title: `Cursor fixture ${index}`,
+        body: "cursor pagination target",
+        importance: index,
+        confidence: 100,
+      });
+    }
+
+    const filters = buildFilters();
+    const firstPage = db.searchMemoryPage(filters);
+    assert.deepEqual(firstPage.hits.map((hit) => hit.memory.importance), [5, 4]);
+    assert.equal(firstPage.page.limit, 2);
+    assert.equal(firstPage.page.hasMore, true);
+    assert.equal(typeof firstPage.page.nextCursor, "string");
+
+    const secondPage = db.searchMemoryPage({ ...filters, cursor: firstPage.page.nextCursor });
+    assert.deepEqual(secondPage.hits.map((hit) => hit.memory.importance), [3, 2]);
+    assert.equal(secondPage.page.hasMore, true);
+    assert.equal(new Set(firstPage.hits.map((hit) => hit.memory.id)).size, firstPage.hits.length);
+    assert.equal(firstPage.hits.some((hit) => secondPage.hits.some((nextHit) => nextHit.memory.id === hit.memory.id)), false);
+
+    const thirdPage = db.searchMemoryPage({ ...filters, cursor: secondPage.page.nextCursor });
+    assert.deepEqual(thirdPage.hits.map((hit) => hit.memory.importance), [1]);
+    assert.equal(thirdPage.page.hasMore, false);
+    assert.equal(thirdPage.page.nextCursor, undefined);
+
+    for (const orderBy of ["relevance", "updated"]) {
+      const orderedFilters = buildFilters({ orderBy });
+      const orderedFirstPage = db.searchMemoryPage(orderedFilters);
+      const orderedSecondPage = db.searchMemoryPage({ ...orderedFilters, cursor: orderedFirstPage.page.nextCursor });
+      assert.equal(orderedFirstPage.hits.length, 2);
+      assert.equal(orderedSecondPage.hits.length, 2);
+      assert.equal(orderedFirstPage.hits.some((hit) => orderedSecondPage.hits.some((nextHit) => nextHit.memory.id === hit.memory.id)), false, orderBy);
+    }
+
+    assert.throws(() => db.searchMemoryPage({ ...filters, cursor: "not-a-valid-cursor" }), /Invalid Portia search cursor/);
+    assert.throws(() => db.searchMemoryPage({ ...filters, kind: "decision", cursor: firstPage.page.nextCursor }), /does not match the current query and filters/);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("searchMemoryPage does not duplicate FTS hits as substring fallback", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    for (let index = 1; index <= 3; index += 1) {
+      db.createMemory({
+        scopePath: "src/search",
+        kind: "gotcha",
+        title: `FTS fixture ${index}`,
+        body: "token alpha",
+        importance: 5,
+        confidence: 100,
+      });
+      db.createMemory({
+        scopePath: "src/search",
+        kind: "gotcha",
+        title: `Fallback fixture ${index}`,
+        body: "maxSenseResults beta",
+        importance: 5,
+        confidence: 100,
+      });
+    }
+
+    const built = buildSafeFtsQuery("token SenseRes", { matchMode: "any" });
+    assert.equal(built.ok, true);
+    if (!built.ok) throw new Error("failed to build fixture query");
+
+    const filters = {
+      ftsQuery: built.query.expression,
+      rawQuery: built.query.rawQuery,
+      terms: built.query.terms,
+      matchMode: built.query.matchMode,
+      orderBy: "relevance",
+      limit: 2,
+    };
+    const allHits = [];
+    let cursor;
+    for (let page = 0; page < 10; page += 1) {
+      const result = db.searchMemoryPage({ ...filters, cursor });
+      allHits.push(...result.hits);
+      cursor = result.page.nextCursor;
+      if (!cursor) break;
+    }
+
+    assert.equal(allHits.length, 6);
+    assert.equal(new Set(allHits.map((hit) => hit.memory.id)).size, 6);
+    assert.deepEqual(allHits.map((hit) => hit.matchType), ["fts", "fts", "fts", "substring", "substring", "substring"]);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("searchPortiaMemories applies safe query defaults, filters, and limit settings", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    db.createMemory({
+      scopePath: "src/config",
+      kind: "decision",
+      title: "Search limits decision",
+      body: "The searchDefaultLimit setting controls default result size.",
+      importance: 8,
+      confidence: 100,
+    });
+    db.createMemory({
+      scopePath: "docs/config",
+      kind: "gotcha",
+      title: "Search limits gotcha",
+      body: "Use maxSenseResults for sense, not for explicit search.",
+      importance: 4,
+      confidence: 100,
+    });
+
+    const result = searchPortiaMemories(db, settings(project, dbPath, {
+      searchDefaultLimit: 1,
+      searchMaxResults: 2,
+    }), {
+      query: "searchDefaultLimit",
+      kind: "decision",
+      scopePath: "src",
+      limit: 5,
+    }, project);
+
+    assert.equal(result.filters.query, "searchDefaultLimit");
+    assert.equal(result.filters.status, "active");
+    assert.equal(result.filters.scopePath, "src");
+    assert.equal(result.filters.scopeMode, "subtree");
+    assert.equal(result.filters.kind, "decision");
+    assert.equal(result.filters.orderBy, "relevance");
+    assert.equal(result.filters.matchMode, "all");
+    assert.equal(result.filters.limit, 2);
+    assert.equal(result.hits.length, 1);
+    assert.equal(result.hits[0].memory.kind, "decision");
+    assert.match(result.warnings.join("\n"), /searchMaxResults 2/);
+
+    assert.throws(() => searchPortiaMemories(db, settings(project, dbPath), { query: "   " }, project), /Search query is empty/);
+    assert.throws(() => searchPortiaMemories(db, settings(project, dbPath), { query: "limits", scopePath: ".." }, project), /outside the Portia project root/);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("parsePortiaSearchCommandArgs supports human search syntax", () => {
+  assert.deepEqual(parsePortiaSearchCommandArgs("kind decision scope src limit 50 match any order updated query max sense results"), {
+    kind: "decision",
+    scopePath: "src",
+    limit: 50,
+    matchMode: "any",
+    orderBy: "updated",
+    query: "max sense results",
+  });
+  assert.deepEqual(parsePortiaSearchCommandArgs("all cursor abc123 no-fallback query /portia-list"), {
+    status: "any",
+    cursor: "abc123",
+    includeSubstringFallback: false,
+    query: "/portia-list",
+  });
+  assert.throws(() => parsePortiaSearchCommandArgs("cursor abc123"), /repeat the same query/);
 });
 
 test("senseMemories ranks proximity, dependency, and FTS memories", () => {
@@ -730,6 +1198,64 @@ test("listPortiaMemories filters by status, scope, kind, and query", () => {
   }
 });
 
+test("listPortiaMemories applies configured limits and cursor pagination", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  db.close();
+
+  for (let index = 1; index <= 5; index += 1) {
+    insertMemory(dbPath, {
+      id: `list-page-${index}`,
+      scope_path: "src/list",
+      kind: "pointer",
+      title: `List pagination ${index}`,
+      body: "List pagination fixtures should be browsable with cursors.",
+      importance: 10 - index,
+      updated_at: `2026-05-15T00:0${index}:00.000Z`,
+    });
+  }
+
+  const reopened = openPortiaDatabase(dbPath);
+  try {
+    const first = listPortiaMemories(reopened, settings(project, dbPath, {
+      listDefaultLimit: 2,
+      listMaxResults: 3,
+    }), { scopePath: "src/list" }, project);
+
+    assert.deepEqual(first.memories.map((memory) => memory.id), ["list-page-1", "list-page-2"]);
+    assert.equal(first.filters.limit, 2);
+    assert.equal(first.page.limit, 2);
+    assert.equal(first.page.hasMore, true);
+    assert.equal(typeof first.page.nextCursor, "string");
+
+    const second = listPortiaMemories(reopened, settings(project, dbPath, {
+      listDefaultLimit: 2,
+      listMaxResults: 3,
+    }), { scopePath: "src/list", cursor: first.page.nextCursor }, project);
+    assert.deepEqual(second.memories.map((memory) => memory.id), ["list-page-3", "list-page-4"]);
+    assert.equal(second.filters.cursor, first.page.nextCursor);
+    assert.equal(second.page.hasMore, true);
+
+    const capped = listPortiaMemories(reopened, settings(project, dbPath, {
+      listDefaultLimit: 2,
+      listMaxResults: 3,
+    }), { scopePath: "src/list", limit: 99 }, project);
+    assert.equal(capped.filters.limit, 3);
+    assert.equal(capped.memories.length, 3);
+    assert.match(capped.warnings.join("\n"), /listMaxResults 3/);
+
+    assert.throws(() => listPortiaMemories(reopened, settings(project, dbPath), {
+      status: "any",
+      scopePath: "src/list",
+      cursor: first.page.nextCursor,
+    }, project), /cursor does not match/);
+  } finally {
+    reopened.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("inspectPortiaMemory returns memory details and event history", () => {
   const project = tempProject();
   const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
@@ -975,6 +1501,10 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
         autoSense: false,
         autoSenseMaxResults: 99,
         autoSenseMaxChars: 99_999,
+        searchDefaultLimit: 600,
+        searchMaxResults: 999,
+        listDefaultLimit: 90,
+        listMaxResults: 70,
         enablePheromones: false,
         pheromoneRanking: false,
         pheromoneHalfLifeDays: 45,
@@ -993,6 +1523,10 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
     assert.equal(resolved.autoSense, false);
     assert.equal(resolved.autoSenseMaxResults, 12);
     assert.equal(resolved.autoSenseMaxChars, 12_000);
+    assert.equal(resolved.searchDefaultLimit, 500);
+    assert.equal(resolved.searchMaxResults, 500);
+    assert.equal(resolved.listDefaultLimit, 70);
+    assert.equal(resolved.listMaxResults, 70);
     assert.equal(resolved.enablePheromones, false);
     assert.equal(resolved.pheromoneRanking, false);
     assert.equal(resolved.pheromoneHalfLifeDays, 45);

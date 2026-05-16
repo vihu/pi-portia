@@ -1,7 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
+import { buildSearchTerms, decodeSearchCursor, encodeSearchCursor, searchCursorFingerprint } from "./search.ts";
+import type { SearchCursorAfter, SearchCursorPayload } from "./search.ts";
 
 type DatabaseConnection = InstanceType<typeof Database>;
 import type {
@@ -13,17 +15,25 @@ import type {
   ListPheromonesFilters,
   MemoryEvent,
   MemoryListFilters,
+  MemoryListResult,
   MemoryPheromone,
   MemoryPheromoneSummary,
   MemoryRecord,
+  MemorySearchFilters,
+  MemorySearchResult,
   MemoryTraceEvent,
+  PortiaSearchHit,
+  PortiaSearchOrderBy,
   PortiaStats,
   RecordTraceEventInput,
   UpdateMemoryStatusInput,
   UpdateMemoryStatusResult,
 } from "./types.ts";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+const MAX_BROWSE_LIMIT = 500;
+const MAX_SEARCH_LIMIT = MAX_BROWSE_LIMIT;
+const LIST_CURSOR_TYPE = "portia_list";
 const MIN_PHEROMONE_STRENGTH = -5;
 const MAX_PHEROMONE_STRENGTH = 20;
 
@@ -103,6 +113,43 @@ interface ScopeCountRow {
 
 interface FtsRow extends MemoryRow {
   score: number;
+}
+
+interface SearchFtsRow extends FtsRow {
+  snippet: string | null;
+}
+
+interface ListCursorAfter {
+  id: string;
+  status: string;
+  importance: number;
+  updatedAt: string;
+}
+
+interface ListCursorPayload {
+  v: 1;
+  type: typeof LIST_CURSOR_TYPE;
+  fingerprint: string;
+  after: ListCursorAfter;
+}
+
+interface TableInfoRow {
+  name: string;
+}
+
+interface SearchTermsBackfillRow {
+  rowid: number;
+  scope_path: string;
+  kind: string;
+  title: string | null;
+  body: string;
+  source_type: string | null;
+  source_ref: string | null;
+}
+
+interface TriggerSqlRow {
+  name: string;
+  sql: string | null;
 }
 
 function toMemory(row: MemoryRow): MemoryRecord {
@@ -192,6 +239,155 @@ function clampLimit(value: number | undefined, fallback: number): number {
   return Math.max(1, Math.min(100, Math.floor(value)));
 }
 
+function clampSearchLimit(value: number | undefined, fallback: number): number {
+  if (!value || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(MAX_SEARCH_LIMIT, Math.floor(value)));
+}
+
+function clampBrowseLimit(value: number | undefined, fallback: number): number {
+  if (!value || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(MAX_BROWSE_LIMIT, Math.floor(value)));
+}
+
+function memoryColumn(alias: string, column: string): string {
+  return alias ? `${alias}.${column}` : column;
+}
+
+function appendMemorySearchFilters(clauses: string[], params: Record<string, unknown>, filters: MemorySearchFilters, alias = "m"): void {
+  const status = filters.status ?? "active";
+  if (status !== "any") {
+    clauses.push(`${memoryColumn(alias, "status")} = @status`);
+    params.status = status;
+  }
+
+  if (filters.scopePath) {
+    const scopeMode = filters.scopeMode ?? "subtree";
+    if (scopeMode === "exact") {
+      clauses.push(`${memoryColumn(alias, "scope_path")} = @scopePath`);
+      params.scopePath = filters.scopePath;
+    } else if (filters.scopePath !== ".") {
+      clauses.push(`(${memoryColumn(alias, "scope_path")} = @scopePath or ${memoryColumn(alias, "scope_path")} like @scopePathPrefix escape '\\')`);
+      params.scopePath = filters.scopePath;
+      params.scopePathPrefix = `${escapeLike(filters.scopePath)}/%`;
+    }
+  }
+
+  if (filters.kind) {
+    clauses.push(`${memoryColumn(alias, "kind")} = @kind`);
+    params.kind = filters.kind;
+  }
+}
+
+function searchableTextSql(alias = "m"): string {
+  const prefix = alias ? `${alias}.` : "";
+  return `lower(
+    coalesce(${prefix}title, '') || ' ' || ${prefix}body || ' ' || ${prefix}scope_path || ' ' || ${prefix}kind || ' ' ||
+    coalesce(${prefix}source_type, '') || ' ' || coalesce(${prefix}source_ref, '') || ' ' || coalesce(${prefix}search_terms, '')
+  )`;
+}
+
+function appendSubstringSearchFilter(clauses: string[], params: Record<string, unknown>, filters: MemorySearchFilters, alias = "m"): boolean {
+  const matchMode = filters.matchMode ?? "all";
+  const rawTerms = matchMode === "phrase"
+    ? [filters.rawQuery ?? filters.terms?.join(" ") ?? ""]
+    : (filters.terms && filters.terms.length > 0 ? filters.terms : [filters.rawQuery ?? ""]);
+  const terms = rawTerms.map((term) => term.trim().toLowerCase()).filter(Boolean).slice(0, 20);
+  if (terms.length === 0) return false;
+
+  const searchableText = searchableTextSql(alias);
+  const termClauses = terms.map((term, index) => {
+    const key = `substring${index}`;
+    params[key] = `%${escapeLike(term)}%`;
+    return `${searchableText} like @${key} escape '\\'`;
+  });
+
+  clauses.push(matchMode === "any" ? `(${termClauses.join(" or ")})` : `(${termClauses.join(" and ")})`);
+  return true;
+}
+
+function memorySearchOrderSql(orderBy: PortiaSearchOrderBy, alias = "m", relevanceColumn = "score"): string {
+  const id = memoryColumn(alias, "id");
+  const importance = memoryColumn(alias, "importance");
+  const updatedAt = memoryColumn(alias, "updated_at");
+
+  if (orderBy === "updated") return `${updatedAt} desc, ${id} asc`;
+  if (orderBy === "importance") return `${importance} desc, ${updatedAt} desc, ${id} asc`;
+  return `${relevanceColumn} asc, ${id} asc`;
+}
+
+function compareSearchHits(orderBy: PortiaSearchOrderBy, a: PortiaSearchHit, b: PortiaSearchHit): number {
+  if (orderBy === "updated") return b.memory.updatedAt.localeCompare(a.memory.updatedAt) || a.memory.id.localeCompare(b.memory.id);
+  if (orderBy === "importance") {
+    return b.memory.importance - a.memory.importance
+      || b.memory.updatedAt.localeCompare(a.memory.updatedAt)
+      || a.memory.id.localeCompare(b.memory.id);
+  }
+
+  return (a.score ?? Number.POSITIVE_INFINITY) - (b.score ?? Number.POSITIVE_INFINITY)
+    || a.memory.id.localeCompare(b.memory.id);
+}
+
+function requireCursorNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`Invalid Portia search cursor: missing ${label}.`);
+  return value;
+}
+
+function requireCursorString(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value) throw new Error(`Invalid Portia search cursor: missing ${label}.`);
+  return value;
+}
+
+function appendSearchCursorClause(
+  clauses: string[],
+  params: Record<string, unknown>,
+  after: SearchCursorAfter,
+  orderBy: PortiaSearchOrderBy | "fallbackRelevance",
+  alias = "",
+): void {
+  const id = memoryColumn(alias, "id");
+  const updatedAt = memoryColumn(alias, "updated_at");
+  const importance = memoryColumn(alias, "importance");
+  params.cursorId = after.id;
+
+  if (orderBy === "relevance") {
+    const score = memoryColumn(alias, "score");
+    params.cursorScore = requireCursorNumber(after.score, "relevance score");
+    clauses.push(`(${score} > @cursorScore or (${score} = @cursorScore and ${id} > @cursorId))`);
+    return;
+  }
+
+  if (orderBy === "updated") {
+    params.cursorUpdatedAt = requireCursorString(after.updatedAt, "updated timestamp");
+    clauses.push(`(${updatedAt} < @cursorUpdatedAt or (${updatedAt} = @cursorUpdatedAt and ${id} > @cursorId))`);
+    return;
+  }
+
+  params.cursorImportance = requireCursorNumber(after.importance, "importance");
+  params.cursorUpdatedAt = requireCursorString(after.updatedAt, "updated timestamp");
+  clauses.push(`(${importance} < @cursorImportance or (${importance} = @cursorImportance and (${updatedAt} < @cursorUpdatedAt or (${updatedAt} = @cursorUpdatedAt and ${id} > @cursorId))))`);
+}
+
+function cursorAfterHit(hit: PortiaSearchHit): SearchCursorAfter {
+  return {
+    matchType: hit.matchType,
+    id: hit.memory.id,
+    score: hit.score,
+    updatedAt: hit.memory.updatedAt,
+    importance: hit.memory.importance,
+  };
+}
+
+function encodeNextSearchCursor(fingerprint: string, orderBy: PortiaSearchOrderBy, hit: PortiaSearchHit): string {
+  const payload: SearchCursorPayload = {
+    v: 1,
+    type: "portia_search",
+    fingerprint,
+    orderBy,
+    after: cursorAfterHit(hit),
+  };
+  return encodeSearchCursor(payload);
+}
+
 function memorySelectSql(): string {
   return `
     select rowid, id, scope_path, kind, title, body, status, importance, confidence,
@@ -200,9 +396,18 @@ function memorySelectSql(): string {
   `;
 }
 
-function memoryStatusOrderSql(): string {
+function memoryStatusRank(status: string): number {
+  if (status === "active") return 0;
+  if (status === "stale") return 1;
+  if (status === "superseded") return 2;
+  if (status === "deleted") return 3;
+  return 9;
+}
+
+function memoryStatusOrderSql(alias = ""): string {
+  const status = memoryColumn(alias, "status");
   return `
-    case status
+    case ${status}
       when 'active' then 0
       when 'stale' then 1
       when 'superseded' then 2
@@ -210,6 +415,120 @@ function memoryStatusOrderSql(): string {
       else 9
     end
   `;
+}
+
+function listCursorFingerprint(filters: MemoryListFilters): string {
+  const normalized = {
+    status: filters.status ?? undefined,
+    scopePath: filters.scopePath ?? undefined,
+    kind: filters.kind ?? undefined,
+    query: filters.query?.trim().toLowerCase() || undefined,
+    orderBy: "inventory",
+  };
+
+  return createHash("sha256")
+    .update(JSON.stringify(normalized))
+    .digest("base64url")
+    .slice(0, 24);
+}
+
+function isListCursorAfter(value: unknown): value is ListCursorAfter {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as ListCursorAfter;
+  return typeof candidate.id === "string" && candidate.id.length > 0
+    && typeof candidate.status === "string" && candidate.status.length > 0
+    && typeof candidate.importance === "number" && Number.isFinite(candidate.importance)
+    && typeof candidate.updatedAt === "string" && candidate.updatedAt.length > 0;
+}
+
+function encodeListCursor(payload: ListCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url");
+}
+
+function decodeListCursor(cursor: string, expectedFingerprint: string): ListCursorPayload {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+  } catch {
+    throw new Error("Invalid Portia list cursor: cursor is not valid encoded JSON.");
+  }
+
+  if (!parsed || typeof parsed !== "object") throw new Error("Invalid Portia list cursor: cursor payload is not an object.");
+  const payload = parsed as ListCursorPayload;
+  if (payload.v !== 1 || payload.type !== LIST_CURSOR_TYPE || !isListCursorAfter(payload.after)) {
+    throw new Error("Invalid Portia list cursor: unsupported cursor payload.");
+  }
+  if (payload.fingerprint !== expectedFingerprint) {
+    throw new Error("Invalid Portia list cursor: cursor does not match the current filters.");
+  }
+
+  return payload;
+}
+
+function listCursorAfterMemory(memory: MemoryRecord): ListCursorAfter {
+  return {
+    id: memory.id,
+    status: memory.status,
+    importance: memory.importance,
+    updatedAt: memory.updatedAt,
+  };
+}
+
+function encodeNextListCursor(fingerprint: string, memory: MemoryRecord): string {
+  return encodeListCursor({
+    v: 1,
+    type: LIST_CURSOR_TYPE,
+    fingerprint,
+    after: listCursorAfterMemory(memory),
+  });
+}
+
+function appendListCursorClause(clauses: string[], params: Record<string, unknown>, after: ListCursorAfter, alias = ""): void {
+  const id = memoryColumn(alias, "id");
+  const importance = memoryColumn(alias, "importance");
+  const updatedAt = memoryColumn(alias, "updated_at");
+  const statusRank = memoryStatusOrderSql(alias);
+  params.cursorStatusRank = memoryStatusRank(after.status);
+  params.cursorImportance = after.importance;
+  params.cursorUpdatedAt = after.updatedAt;
+  params.cursorId = after.id;
+  clauses.push(`(
+    ${statusRank} > @cursorStatusRank
+    or (${statusRank} = @cursorStatusRank and (
+      ${importance} < @cursorImportance
+      or (${importance} = @cursorImportance and (
+        ${updatedAt} < @cursorUpdatedAt
+        or (${updatedAt} = @cursorUpdatedAt and ${id} > @cursorId)
+      ))
+    ))
+  )`);
+}
+
+function appendMemoryListFilters(clauses: string[], params: Record<string, unknown>, filters: MemoryListFilters, alias = ""): void {
+  if (filters.status && filters.status !== "any") {
+    clauses.push(`${memoryColumn(alias, "status")} = @status`);
+    params.status = filters.status;
+  }
+
+  if (filters.scopePath) {
+    clauses.push(`${memoryColumn(alias, "scope_path")} = @scopePath`);
+    params.scopePath = filters.scopePath;
+  }
+
+  if (filters.kind) {
+    clauses.push(`${memoryColumn(alias, "kind")} = @kind`);
+    params.kind = filters.kind;
+  }
+
+  if (filters.query?.trim()) {
+    clauses.push(`
+      lower(
+        coalesce(${memoryColumn(alias, "title")}, '') || ' ' || ${memoryColumn(alias, "body")} || ' ' || ${memoryColumn(alias, "scope_path")} || ' ' || ${memoryColumn(alias, "kind")} || ' ' ||
+        coalesce(${memoryColumn(alias, "source_type")}, '') || ' ' || coalesce(${memoryColumn(alias, "source_ref")}, '')
+      ) like @query escape '\\'
+    `);
+    params.query = `%${escapeLike(filters.query.trim().toLowerCase())}%`;
+  }
 }
 
 function normalizeDuplicateText(value: string | undefined): string {
@@ -252,6 +571,140 @@ function relatedScore(queryTokens: Set<string>, memory: MemoryRecord): number {
   return overlap / Math.sqrt(queryTokens.size * memoryTokens.size);
 }
 
+function tableColumns(db: DatabaseConnection, tableName: string): string[] {
+  return (db.prepare(`pragma table_info(${tableName})`).all() as TableInfoRow[]).map((row) => row.name);
+}
+
+function ensureSearchTermsColumn(db: DatabaseConnection): void {
+  if (!tableColumns(db, "memories").includes("search_terms")) {
+    db.exec("alter table memories add column search_terms text");
+  }
+}
+
+function memoryFtsNeedsRebuild(db: DatabaseConnection): boolean {
+  const exists = (db.prepare("select count(*) as count from sqlite_master where type = 'table' and name = 'memory_fts'").get() as CountRow | undefined)?.count ?? 0;
+  if (exists === 0) return true;
+
+  const expectedColumns = ["title", "body", "scope_path", "kind", "source_type", "source_ref", "search_terms"];
+  const existingColumns = tableColumns(db, "memory_fts");
+  return expectedColumns.join("|") !== existingColumns.join("|");
+}
+
+function memoryFtsTriggersNeedRebuild(db: DatabaseConnection): boolean {
+  const expectedNames = new Set(["memories_ai", "memories_ad", "memories_au"]);
+  const rows = db.prepare(`
+    select name, sql
+    from sqlite_master
+    where type = 'trigger' and name in ('memories_ai', 'memories_ad', 'memories_au')
+  `).all() as TriggerSqlRow[];
+
+  if (rows.length !== expectedNames.size) return true;
+  for (const row of rows) {
+    expectedNames.delete(row.name);
+    const sql = row.sql ?? "";
+    if (!sql.includes("source_type") || !sql.includes("source_ref") || !sql.includes("search_terms")) return true;
+  }
+
+  return expectedNames.size > 0;
+}
+
+function dropMemoryFtsTriggers(db: DatabaseConnection): void {
+  db.exec(`
+    drop trigger if exists memories_ai;
+    drop trigger if exists memories_ad;
+    drop trigger if exists memories_au;
+  `);
+}
+
+function createMemoryFts(db: DatabaseConnection): void {
+  db.exec(`
+    create virtual table if not exists memory_fts using fts5(
+      title,
+      body,
+      scope_path,
+      kind,
+      source_type,
+      source_ref,
+      search_terms,
+      content='memories',
+      content_rowid='rowid'
+    );
+  `);
+}
+
+function createMemoryFtsTriggers(db: DatabaseConnection): void {
+  dropMemoryFtsTriggers(db);
+  db.exec(`
+    create trigger memories_ai after insert on memories begin
+      insert into memory_fts(rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values (new.rowid, new.title, new.body, new.scope_path, new.kind, new.source_type, new.source_ref, new.search_terms);
+    end;
+
+    create trigger memories_ad after delete on memories begin
+      insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind, old.source_type, old.source_ref, old.search_terms);
+    end;
+
+    create trigger memories_au after update on memories begin
+      insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind, old.source_type, old.source_ref, old.search_terms);
+      insert into memory_fts(rowid, title, body, scope_path, kind, source_type, source_ref, search_terms)
+      values (new.rowid, new.title, new.body, new.scope_path, new.kind, new.source_type, new.source_ref, new.search_terms);
+    end;
+  `);
+}
+
+function backfillSearchTerms(db: DatabaseConnection): number {
+  const rows = db.prepare(`
+    select rowid, scope_path, kind, title, body, source_type, source_ref
+    from memories
+    where search_terms is null
+    order by rowid asc
+  `).all() as SearchTermsBackfillRow[];
+
+  if (rows.length === 0) return 0;
+
+  const update = db.prepare("update memories set search_terms = @searchTerms where rowid = @rowid");
+  let changed = 0;
+  for (const row of rows) {
+    const result = update.run({
+      rowid: row.rowid,
+      searchTerms: buildSearchTerms({
+        scopePath: row.scope_path,
+        kind: row.kind,
+        title: row.title,
+        body: row.body,
+        sourceType: row.source_type,
+        sourceRef: row.source_ref,
+      }),
+    }) as { changes?: number };
+    changed += result.changes ?? 0;
+  }
+
+  return changed;
+}
+
+function rebuildMemoryFts(db: DatabaseConnection): void {
+  db.prepare("insert into memory_fts(memory_fts) values ('rebuild')").run();
+}
+
+function ensureMemoryFts(db: DatabaseConnection): void {
+  const ftsNeedsRebuild = memoryFtsNeedsRebuild(db);
+  const triggersNeedRebuild = ftsNeedsRebuild || memoryFtsTriggersNeedRebuild(db);
+  if (triggersNeedRebuild) dropMemoryFtsTriggers(db);
+
+  const backfilledRows = backfillSearchTerms(db);
+
+  if (ftsNeedsRebuild) {
+    db.exec("drop table if exists memory_fts");
+    createMemoryFts(db);
+  }
+
+  if (triggersNeedRebuild) createMemoryFtsTriggers(db);
+
+  if (ftsNeedsRebuild || backfilledRows > 0) rebuildMemoryFts(db);
+}
+
 function runMigrations(db: DatabaseConnection): void {
   const migrate = db.transaction(() => {
     db.exec(`
@@ -274,38 +727,13 @@ function runMigrations(db: DatabaseConnection): void {
         created_by text,
         supersedes_id text references memories(id),
         source_type text,
-        source_ref text
+        source_ref text,
+        search_terms text
       );
 
       create index if not exists memories_status_scope_idx on memories(status, scope_path);
       create index if not exists memories_kind_idx on memories(kind);
       create index if not exists memories_updated_idx on memories(updated_at);
-
-      create virtual table if not exists memory_fts using fts5(
-        title,
-        body,
-        scope_path,
-        kind,
-        content='memories',
-        content_rowid='rowid'
-      );
-
-      create trigger if not exists memories_ai after insert on memories begin
-        insert into memory_fts(rowid, title, body, scope_path, kind)
-        values (new.rowid, new.title, new.body, new.scope_path, new.kind);
-      end;
-
-      create trigger if not exists memories_ad after delete on memories begin
-        insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind)
-        values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind);
-      end;
-
-      create trigger if not exists memories_au after update on memories begin
-        insert into memory_fts(memory_fts, rowid, title, body, scope_path, kind)
-        values ('delete', old.rowid, old.title, old.body, old.scope_path, old.kind);
-        insert into memory_fts(rowid, title, body, scope_path, kind)
-        values (new.rowid, new.title, new.body, new.scope_path, new.kind);
-      end;
 
       create table if not exists memory_events (
         id text primary key,
@@ -364,6 +792,9 @@ function runMigrations(db: DatabaseConnection): void {
       );
     `);
 
+    ensureSearchTermsColumn(db);
+    ensureMemoryFts(db);
+
     db.prepare(`
       insert into portia_meta(key, value)
       values ('schema_version', ?)
@@ -419,15 +850,23 @@ export class PortiaDatabase {
     const now = new Date().toISOString();
     const createdBy = input.createdBy ?? "portia";
     const payloadJson = JSON.stringify(input.eventPayload ?? { action: "record" });
+    const searchTerms = buildSearchTerms({
+      scopePath: input.scopePath,
+      kind: input.kind,
+      title: input.title,
+      body: input.body,
+      sourceType: input.sourceType,
+      sourceRef: input.sourceRef,
+    });
 
     const insert = this.db.transaction(() => {
       this.db.prepare(`
         insert into memories (
           id, scope_path, kind, title, body, status, importance, confidence,
-          created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+          created_at, updated_at, created_by, supersedes_id, source_type, source_ref, search_terms
         ) values (
           @id, @scopePath, @kind, @title, @body, 'active', @importance, @confidence,
-          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef
+          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef, @searchTerms
         )
       `).run({
         id,
@@ -443,6 +882,7 @@ export class PortiaDatabase {
         supersedesId: input.supersedesId ?? null,
         sourceType: input.sourceType ?? null,
         sourceRef: input.sourceRef ?? null,
+        searchTerms,
       });
 
       this.db.prepare(`
@@ -477,6 +917,14 @@ export class PortiaDatabase {
     const now = new Date().toISOString();
     const createdBy = input.createdBy ?? "portia";
     const payloadJson = JSON.stringify(input.eventPayload ?? { action: "record" });
+    const searchTerms = buildSearchTerms({
+      scopePath: input.scopePath,
+      kind: input.kind,
+      title: input.title,
+      body: input.body,
+      sourceType: input.sourceType,
+      sourceRef: input.sourceRef,
+    });
     const eventPayload = input.eventPayload ?? {};
     const evidence = typeof eventPayload.evidence === "string" ? eventPayload.evidence : undefined;
     const supersedePayloadJson = JSON.stringify({
@@ -494,10 +942,10 @@ export class PortiaDatabase {
       this.db.prepare(`
         insert into memories (
           id, scope_path, kind, title, body, status, importance, confidence,
-          created_at, updated_at, created_by, supersedes_id, source_type, source_ref
+          created_at, updated_at, created_by, supersedes_id, source_type, source_ref, search_terms
         ) values (
           @id, @scopePath, @kind, @title, @body, 'active', @importance, @confidence,
-          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef
+          @createdAt, @updatedAt, @createdBy, @supersedesId, @sourceType, @sourceRef, @searchTerms
         )
       `).run({
         id,
@@ -513,6 +961,7 @@ export class PortiaDatabase {
         supersedesId: input.supersedesId,
         sourceType: input.sourceType ?? null,
         sourceRef: input.sourceRef ?? null,
+        searchTerms,
       });
 
       this.db.prepare(`
@@ -609,36 +1058,17 @@ export class PortiaDatabase {
       .map((candidate) => candidate.memory);
   }
 
-  listMemories(filters: MemoryListFilters = {}): MemoryRecord[] {
+  listMemoryPage(filters: MemoryListFilters = {}): MemoryListResult {
+    const limit = clampBrowseLimit(filters.limit, 30);
+    const fingerprint = listCursorFingerprint(filters);
+    const after = filters.cursor ? decodeListCursor(filters.cursor, fingerprint).after : undefined;
     const clauses: string[] = [];
     const params: Record<string, unknown> = {
-      limit: clampLimit(filters.limit, 20),
+      limit: limit + 1,
     };
 
-    if (filters.status && filters.status !== "any") {
-      clauses.push("status = @status");
-      params.status = filters.status;
-    }
-
-    if (filters.scopePath) {
-      clauses.push("scope_path = @scopePath");
-      params.scopePath = filters.scopePath;
-    }
-
-    if (filters.kind) {
-      clauses.push("kind = @kind");
-      params.kind = filters.kind;
-    }
-
-    if (filters.query?.trim()) {
-      clauses.push(`
-        lower(
-          coalesce(title, '') || ' ' || body || ' ' || scope_path || ' ' || kind || ' ' ||
-          coalesce(source_type, '') || ' ' || coalesce(source_ref, '')
-        ) like @query escape '\\'
-      `);
-      params.query = `%${escapeLike(filters.query.trim().toLowerCase())}%`;
-    }
+    appendMemoryListFilters(clauses, params, filters);
+    if (after) appendListCursorClause(clauses, params, after);
 
     const where = clauses.length > 0 ? `where ${clauses.join(" and ")}` : "";
     const rows = this.db.prepare(`
@@ -648,7 +1078,23 @@ export class PortiaDatabase {
       limit @limit
     `).all(params) as MemoryRow[];
 
-    return rows.map(toMemory);
+    const memories = rows.map(toMemory);
+    const hasMore = memories.length > limit;
+    const pageMemories = hasMore ? memories.slice(0, limit) : memories;
+    const lastMemory = pageMemories.at(-1);
+
+    return {
+      memories: pageMemories,
+      page: {
+        limit,
+        hasMore,
+        nextCursor: hasMore && lastMemory ? encodeNextListCursor(fingerprint, lastMemory) : undefined,
+      },
+    };
+  }
+
+  listMemories(filters: MemoryListFilters = {}): MemoryRecord[] {
+    return this.listMemoryPage(filters).memories;
   }
 
   searchMemories(query: string, filters: MemoryListFilters = {}): MemoryRecord[] {
@@ -995,6 +1441,133 @@ export class PortiaDatabase {
     `).all(...uniqueScopes) as MemoryRow[];
 
     return rows.map(toMemory);
+  }
+
+  searchMemoryPage(filters: MemorySearchFilters): MemorySearchResult {
+    const ftsQuery = filters.ftsQuery.trim();
+    const limit = clampSearchLimit(filters.limit, 30);
+    if (!ftsQuery) return { hits: [], page: { limit, hasMore: false } };
+
+    const orderBy = filters.orderBy ?? "relevance";
+    const includeSubstringFallback = filters.includeSubstringFallback ?? true;
+    const fetchLimit = limit + 1;
+    const fingerprint = searchCursorFingerprint(filters);
+    const cursor = filters.cursor ? decodeSearchCursor(filters.cursor, fingerprint, orderBy) : undefined;
+    const ftsHits: PortiaSearchHit[] = [];
+
+    if (!(orderBy === "relevance" && cursor?.after.matchType === "substring")) {
+      const ftsClauses = ["memory_fts match @ftsQuery"];
+      const ftsOuterClauses: string[] = [];
+      const ftsParams: Record<string, unknown> = { ftsQuery, limit: fetchLimit };
+      appendMemorySearchFilters(ftsClauses, ftsParams, filters, "m");
+
+      if (cursor) {
+        if (orderBy === "relevance") appendSearchCursorClause(ftsOuterClauses, ftsParams, cursor.after, "relevance");
+        else appendSearchCursorClause(ftsOuterClauses, ftsParams, cursor.after, orderBy);
+      }
+
+      const ftsOuterWhere = ftsOuterClauses.length > 0 ? `where ${ftsOuterClauses.join(" and ")}` : "";
+      const ftsRows = this.db.prepare(`
+        with ranked as (
+          select m.rowid, m.id, m.scope_path, m.kind, m.title, m.body, m.status, m.importance, m.confidence,
+                 m.created_at, m.updated_at, m.created_by, m.supersedes_id, m.source_type, m.source_ref,
+                 bm25(memory_fts, 8.0, 1.0, 4.0, 2.0, 1.5, 3.0, 6.0) as score,
+                 snippet(memory_fts, -1, '[', ']', '…', 24) as snippet
+          from memory_fts
+          join memories m on memory_fts.rowid = m.rowid
+          where ${ftsClauses.join(" and ")}
+        )
+        select rowid, id, scope_path, kind, title, body, status, importance, confidence,
+               created_at, updated_at, created_by, supersedes_id, source_type, source_ref,
+               score, snippet
+        from ranked
+        ${ftsOuterWhere}
+        order by ${memorySearchOrderSql(orderBy, "")}
+        limit @limit
+      `).all(ftsParams) as SearchFtsRow[];
+
+      ftsHits.push(...ftsRows.map((row) => ({
+        memory: toMemory(row),
+        matchType: "fts" as const,
+        score: row.score,
+        snippet: row.snippet ?? undefined,
+      })));
+    }
+
+    const hitsById = new Map<string, PortiaSearchHit>(ftsHits.map((hit) => [hit.memory.id, hit]));
+    const fallbackHits: PortiaSearchHit[] = [];
+    const fallbackFetchLimit = orderBy === "relevance" ? Math.max(0, fetchLimit - ftsHits.length) : fetchLimit;
+
+    if (includeSubstringFallback && fallbackFetchLimit > 0) {
+      const fallbackClauses: string[] = [];
+      const fallbackParams: Record<string, unknown> = { ftsQuery, limit: fallbackFetchLimit };
+      appendMemorySearchFilters(fallbackClauses, fallbackParams, filters, "m");
+      const hasSubstringQuery = appendSubstringSearchFilter(fallbackClauses, fallbackParams, filters, "m");
+
+      if (hasSubstringQuery) {
+        fallbackClauses.push("m.rowid not in (select rowid from memory_fts where memory_fts match @ftsQuery)");
+
+        if (cursor) {
+          if (orderBy === "relevance") {
+            if (cursor.after.matchType === "substring") appendSearchCursorClause(fallbackClauses, fallbackParams, cursor.after, "fallbackRelevance", "m");
+          } else {
+            appendSearchCursorClause(fallbackClauses, fallbackParams, cursor.after, orderBy, "m");
+          }
+        }
+
+        const excludedIds = [...hitsById.keys()];
+        if (excludedIds.length > 0) {
+          const excludedPlaceholders = excludedIds.map((id, index) => {
+            const key = `excluded${index}`;
+            fallbackParams[key] = id;
+            return `@${key}`;
+          });
+          fallbackClauses.push(`m.id not in (${excludedPlaceholders.join(", ")})`);
+        }
+
+        const where = fallbackClauses.length > 0 ? `where ${fallbackClauses.join(" and ")}` : "";
+        const fallbackOrder = orderBy === "relevance"
+          ? "m.importance desc, m.updated_at desc, m.id asc"
+          : memorySearchOrderSql(orderBy, "m");
+        const fallbackRows = this.db.prepare(`
+          select m.rowid, m.id, m.scope_path, m.kind, m.title, m.body, m.status, m.importance, m.confidence,
+                 m.created_at, m.updated_at, m.created_by, m.supersedes_id, m.source_type, m.source_ref
+          from memories m
+          ${where}
+          order by ${fallbackOrder}
+          limit @limit
+        `).all(fallbackParams) as MemoryRow[];
+
+        for (const row of fallbackRows) {
+          const hit: PortiaSearchHit = { memory: toMemory(row), matchType: "substring" };
+          if (!hitsById.has(hit.memory.id)) {
+            hitsById.set(hit.memory.id, hit);
+            fallbackHits.push(hit);
+          }
+        }
+      }
+    }
+
+    const combined = orderBy === "relevance"
+      ? [...ftsHits, ...fallbackHits]
+      : [...hitsById.values()].sort((a, b) => compareSearchHits(orderBy, a, b));
+    const hits = combined.slice(0, limit);
+    const hasMore = combined.length > limit;
+    const lastHit = hits.at(-1);
+    const nextCursor = hasMore && lastHit ? encodeNextSearchCursor(fingerprint, orderBy, lastHit) : undefined;
+
+    return {
+      hits,
+      page: {
+        limit,
+        hasMore,
+        nextCursor,
+      },
+    };
+  }
+
+  searchMemoryHits(filters: MemorySearchFilters): PortiaSearchHit[] {
+    return this.searchMemoryPage(filters).hits;
   }
 
   searchActiveMemories(ftsQuery: string, limit: number): Array<MemoryRecord & { ftsScore: number }> {

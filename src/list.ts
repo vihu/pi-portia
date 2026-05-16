@@ -4,9 +4,10 @@ import { MEMORY_KINDS, MEMORY_STATUSES } from "./types.ts";
 import { isPathInside, normalizeScopePath, toProjectRelative } from "./root.ts";
 import type { MemoryKind, MemoryListStatus, PortiaListResult, PortiaSettings } from "./types.ts";
 
-const DEFAULT_LIST_LIMIT = 20;
-const MAX_LIST_LIMIT = 100;
+const DEFAULT_LIST_LIMIT = 30;
+const DEFAULT_LIST_MAX_RESULTS = 250;
 const MAX_QUERY_LENGTH = 500;
+const MAX_CURSOR_LENGTH = 4_000;
 
 export interface PortiaListInput {
   status?: MemoryListStatus;
@@ -14,6 +15,7 @@ export interface PortiaListInput {
   kind?: MemoryKind | string;
   query?: string;
   limit?: number;
+  cursor?: string;
 }
 
 function stripAtPrefix(input: string): string {
@@ -43,10 +45,16 @@ function parseKind(value: string | undefined): MemoryKind | undefined {
   throw new Error(`Invalid Portia memory kind: ${value}`);
 }
 
-function parseLimit(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_LIST_LIMIT;
+function parseLimit(settings: PortiaSettings, value: number | undefined, warnings: string[]): number {
+  const defaultLimit = settings.listDefaultLimit ?? DEFAULT_LIST_LIMIT;
+  const maxResults = settings.listMaxResults ?? DEFAULT_LIST_MAX_RESULTS;
+  if (value === undefined) return defaultLimit;
   if (!Number.isInteger(value) || value <= 0) throw new Error("Portia list limit must be a positive integer.");
-  return Math.min(value, MAX_LIST_LIMIT);
+  if (value > maxResults) {
+    warnings.push(`Requested limit ${value} exceeds portia.listMaxResults ${maxResults}; using ${maxResults}.`);
+    return maxResults;
+  }
+  return value;
 }
 
 function resolveScopePath(settings: PortiaSettings, cwd: string, inputScopePath: string): string {
@@ -69,18 +77,18 @@ export function listPortiaMemories(db: PortiaDatabase, settings: PortiaSettings,
   const kind = parseKind(input.kind);
   const scopePath = input.scopePath ? resolveScopePath(settings, cwd, input.scopePath) : undefined;
   const query = trimOptional(input.query, MAX_QUERY_LENGTH, "Portia list query");
-  const limit = parseLimit(input.limit);
   const warnings: string[] = [];
+  const limit = parseLimit(settings, input.limit, warnings);
+  const cursor = trimOptional(input.cursor, MAX_CURSOR_LENGTH, "Portia list cursor");
 
-  const memories = db.listMemories({
+  const result = db.listMemoryPage({
     status,
     scopePath,
     kind,
     query,
     limit,
+    cursor,
   });
-
-  if (memories.length === limit) warnings.push("Result limit reached; narrow the query or increase the tool limit if needed.");
 
   return {
     projectRoot: settings.projectRoot,
@@ -90,9 +98,11 @@ export function listPortiaMemories(db: PortiaDatabase, settings: PortiaSettings,
       scopePath,
       kind,
       query,
-      limit,
+      limit: result.page.limit,
+      cursor,
     },
-    memories,
+    memories: result.memories,
+    page: result.page,
     warnings,
   };
 }
