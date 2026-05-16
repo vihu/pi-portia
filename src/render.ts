@@ -6,9 +6,11 @@ import type {
   MemoryPheromoneSummary,
   MemoryRecord,
   MemoryTraceEvent,
+  PortiaDoctorResult,
   PortiaInspectResult,
   PortiaListResult,
   PortiaRecordResult,
+  PortiaReindexResult,
   PortiaRepairResult,
   PortiaSearchHit,
   PortiaSearchOutput,
@@ -509,6 +511,70 @@ export function renderRecord(result: PortiaRecordResult): string {
   if (!result.written && result.skipReason !== "duplicate") {
     lines.push("");
     lines.push("This is a structured proposal only. A main session with writePolicy=write can persist it with portia_record.");
+  }
+
+  return lines.join("\n");
+}
+
+export function renderReindex(result: PortiaReindexResult): string {
+  const lines: string[] = [];
+  lines.push("# Portia Reindex");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Status: ${result.written ? "written" : result.dryRun ? "dry-run" : "proposal-only"}`);
+  lines.push(`Write policy: ${result.writePolicy}`);
+
+  if (result.warnings.length > 0) {
+    lines.push("");
+    lines.push("## Warnings");
+    for (const warning of result.warnings) lines.push(`- ${warning}`);
+  }
+
+  lines.push("");
+  lines.push("## Before");
+  lines.push(`- memories: ${result.before.memoryCount}`);
+  lines.push(`- null search_terms: ${result.before.nullSearchTerms}`);
+  lines.push(`- FTS rows: ${result.before.ftsRows ?? "unknown"}`);
+
+  if (result.after) {
+    lines.push("");
+    lines.push("## After");
+    lines.push(`- memories: ${result.after.memoryCount}`);
+    lines.push(`- null search_terms: ${result.after.nullSearchTerms}`);
+    lines.push(`- FTS rows: ${result.after.ftsRows ?? "unknown"}`);
+  }
+
+  lines.push("");
+  lines.push("## Actions");
+  lines.push(`- recomputed search_terms: ${result.recomputedSearchTerms}`);
+  lines.push(`- rebuilt FTS: ${result.rebuiltFts}`);
+
+  return lines.join("\n");
+}
+
+export function renderDoctor(result: PortiaDoctorResult): string {
+  const lines: string[] = [];
+  lines.push("# Portia Doctor");
+  lines.push("");
+  lines.push(`Project: ${result.projectRoot}`);
+  lines.push(`DB: ${result.dbPath}`);
+  lines.push(`Enabled: ${result.enabled}`);
+  lines.push(`Schema: ${result.schemaVersion}`);
+  lines.push(`Write policy: ${result.settings.effectiveWritePolicy}`);
+  lines.push(`FTS setting: ${result.settings.enableFts}`);
+  lines.push(`Pheromones: ${result.settings.enablePheromones}`);
+  lines.push("");
+  lines.push("## Summary");
+  lines.push(`- ok: ${result.summary.ok}`);
+  lines.push(`- warnings: ${result.summary.warnings}`);
+  lines.push(`- errors: ${result.summary.errors}`);
+
+  lines.push("");
+  lines.push("## Checks");
+  for (const check of result.checks) {
+    const details = check.details ? ` details=${truncate(JSON.stringify(check.details), 180)}` : "";
+    lines.push(`- [${check.status}] ${check.name}: ${check.message}${details}`);
   }
 
   return lines.join("\n");

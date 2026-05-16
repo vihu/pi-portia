@@ -6,12 +6,15 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { buildAutopilotContext, extractPromptPathCandidates, renderAutopilotGuidance, selectAutopilotTarget } from "../src/autopilot.ts";
 import { resolvePortiaSettings } from "../src/config.ts";
-import { openPortiaDatabase } from "../src/db.ts";
+import { openPortiaDatabase, openPortiaDatabaseReadOnly, PortiaDatabase } from "../src/db.ts";
+import { doctorPortia } from "../src/doctor.ts";
 import { inspectPortiaMemory } from "../src/inspect.ts";
 import { listPortiaMemories } from "../src/list.ts";
 import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, shouldWritePheromones } from "../src/pheromones.ts";
 import { recordPortiaMemory } from "../src/record.ts";
+import { reindexPortia } from "../src/reindex.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
+import { renderDoctor, renderReindex } from "../src/render.ts";
 import { senseMemories } from "../src/retrieval.ts";
 import { buildSafeFtsQuery, buildSearchTerms, parsePlainSearchTerms, parsePortiaSearchCommandArgs, searchPortiaMemories } from "../src/search.ts";
 import { listPortiaTrails } from "../src/trails.ts";
@@ -127,53 +130,135 @@ test("openPortiaDatabase creates schema and FTS search works", () => {
   }
 });
 
+test("doctorPortia reports healthy database checks", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    db.createMemory({
+      scopePath: "src/doctor",
+      kind: "pointer",
+      title: "Doctor fixture",
+      body: "The doctor health check should pass for a migrated database.",
+      importance: 5,
+      confidence: 100,
+    });
+
+    const result = doctorPortia(db, settings(project, dbPath));
+    assert.equal(result.schemaVersion, 3);
+    assert.equal(result.summary.errors, 0);
+    assert.equal(result.checks.some((check) => check.name === "fts_triggers" && check.status === "ok"), true);
+    assert.equal(result.checks.some((check) => check.name === "fts_row_consistency" && check.status === "ok"), true);
+    const rendered = renderDoctor(result);
+    assert.match(rendered, /# Portia Doctor/);
+    assert.match(rendered, /errors: 0/);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("doctorPortia reports trigger, search_terms, and orphan warnings", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  const memory = db.createMemory({
+    scopePath: "src/doctor",
+    kind: "gotcha",
+    body: "Doctor should diagnose broken maintenance state.",
+    importance: 5,
+    confidence: 100,
+  }).memory;
+  db.close();
+
+  const raw = new Database(dbPath);
+  raw.exec("drop trigger memories_ai");
+  raw.prepare("update memories set search_terms = null where id = ?").run(memory.id);
+  raw.prepare(`
+    insert into memory_events (id, memory_id, event_type, payload_json, created_at, created_by)
+    values ('orphan-event', 'missing-memory', 'test', '{}', '2026-01-01T00:00:00.000Z', 'test')
+  `).run();
+  raw.close();
+
+  const broken = openPortiaDatabaseReadOnly(dbPath);
+  try {
+    const result = doctorPortia(broken, settings(project, dbPath));
+    assert.equal(result.summary.errors >= 1, true);
+    assert.equal(result.summary.warnings >= 2, true);
+    assert.equal(result.checks.some((check) => check.name === "fts_triggers" && check.status === "error"), true);
+    assert.equal(result.checks.some((check) => check.name === "search_terms" && check.status === "warning"), true);
+    assert.equal(result.checks.some((check) => check.name === "orphaned_events" && check.status === "warning"), true);
+  } finally {
+    broken.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("reindexPortia previews and repairs search maintenance state", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+  const memory = db.createMemory({
+    scopePath: "src/reindex",
+    kind: "gotcha",
+    body: "Reindex should rebuild maxSenseResults search expansion.",
+    importance: 5,
+    confidence: 100,
+  }).memory;
+  db.close();
+
+  const raw = new Database(dbPath);
+  raw.exec("drop trigger memories_ai");
+  raw.prepare("update memories set search_terms = null where id = ?").run(memory.id);
+
+  const broken = new PortiaDatabase(dbPath, raw);
+  const writableSettings = settings(project, dbPath, { writePolicy: "write", effectiveWritePolicy: "write" });
+  try {
+    const dryRun = reindexPortia(broken, writableSettings, { dryRun: true });
+    assert.equal(dryRun.written, false);
+    assert.equal(dryRun.rebuiltFts, false);
+    assert.equal(dryRun.before.nullSearchTerms, 1);
+
+    const applied = reindexPortia(broken, writableSettings);
+    assert.equal(applied.written, true);
+    assert.equal(applied.rebuiltFts, true);
+    assert.equal(applied.after?.nullSearchTerms, 0);
+    assert.equal(applied.after?.ftsRows, applied.after?.memoryCount);
+    assert.match(renderReindex(applied), /rebuilt FTS: true/);
+
+    const doctor = doctorPortia(broken, writableSettings);
+    assert.equal(doctor.checks.some((check) => check.name === "fts_triggers" && check.status === "error"), false);
+    assert.equal(doctor.checks.some((check) => check.name === "search_terms" && check.status === "warning"), false);
+  } finally {
+    broken.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("reindexPortia does not write when policy is not write", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const result = reindexPortia(db, settings(project, dbPath));
+    assert.equal(result.written, false);
+    assert.equal(result.rebuiltFts, false);
+    assert.match(result.warnings.join("\n"), /write policy is confirm/);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("schema v3 migrates FTS metadata and generated search terms", () => {
   const project = tempProject();
   const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   const legacy = new Database(dbPath);
-  legacy.exec(`
-    create table portia_meta (key text primary key, value text not null);
-    insert into portia_meta(key, value) values ('schema_version', '2');
-
-    create table memories (
-      id text primary key,
-      scope_path text not null,
-      kind text not null,
-      title text,
-      body text not null,
-      status text not null default 'active',
-      importance integer not null default 0,
-      confidence integer not null default 100,
-      created_at text not null,
-      updated_at text not null,
-      created_by text,
-      supersedes_id text references memories(id),
-      source_type text,
-      source_ref text
-    );
-
-    create virtual table memory_fts using fts5(
-      title,
-      body,
-      scope_path,
-      kind,
-      content='memories',
-      content_rowid='rowid'
-    );
-  `);
-  legacy.prepare(`
-    insert into memories (
-      id, scope_path, kind, title, body, status, importance, confidence,
-      created_at, updated_at, created_by, supersedes_id, source_type, source_ref
-    ) values (
-      'legacy-search', 'src/config.ts', 'gotcha', 'Legacy search metadata',
-      'Changing maxSenseResults must be searchable by component words.',
-      'active', 5, 100, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
-      'test', null, 'manual', 'docs/LegacyNote.md'
-    )
-  `).run();
+  legacy.exec(fs.readFileSync(new URL("fixtures/schema-v2.sql", import.meta.url), "utf8"));
   legacy.close();
 
   const migrated = openPortiaDatabase(dbPath);
@@ -350,6 +435,14 @@ test("searchMemoryHits applies weighted FTS filters and substring fallback", () 
       importance: 1,
       confidence: 100,
     }).memory;
+    const searchTermsOnlyHit = db.createMemory({
+      scopePath: "src/config",
+      kind: "gotcha",
+      title: "Generated expansion fixture",
+      body: "Update maxSenseResultsPhaseThreeSnippet carefully when changing retrieval limits.",
+      importance: 1,
+      confidence: 100,
+    }).memory;
 
     const relevance = runSearch("token search", { limit: 10 });
     assert.equal(relevance.at(0)?.memory.id, titleHit.id);
@@ -385,6 +478,11 @@ test("searchMemoryHits applies weighted FTS filters and substring fallback", () 
     const authExact = runSearch("token search", { scopePath: "src/auth", scopeMode: "exact", limit: 10 });
     assert.equal(authExact.some((hit) => hit.memory.id === titleHit.id), true);
     assert.equal(authExact.some((hit) => hit.memory.id === bodyHit.id), false);
+
+    const searchTermsOnly = runSearch("max sense results phase three snippet", { limit: 10 });
+    const searchTermsOnlyMatch = searchTermsOnly.find((hit) => hit.memory.id === searchTermsOnlyHit.id);
+    assert.equal(searchTermsOnlyMatch?.matchType, "fts");
+    assert.equal(searchTermsOnlyMatch?.snippet, undefined);
 
     const substring = runSearch("SenseRes", { limit: 10 });
     assert.equal(substring.some((hit) => hit.memory.id === fallbackHit.id && hit.matchType === "substring"), true);
@@ -1443,6 +1541,7 @@ test("autopilot guidance reflects write policy and can omit record guidance", ()
       effectiveWritePolicy: "write",
     }));
     assert.match(writeGuidance, /Portia project memory autopilot/);
+    assert.match(writeGuidance, /portia_search/);
     assert.match(writeGuidance, /record durable memories without asking/);
 
     const noRecordGuidance = renderAutopilotGuidance(settings(project, dbPath, {

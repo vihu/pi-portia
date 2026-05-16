@@ -28,6 +28,7 @@ export function registerPortiaSenseTool(pi: ExtensionAPI): void {
     promptSnippet: "Retrieve compact project-local spatial memories and gotchas for a path/task query",
     promptGuidelines: [
       "Use portia_sense before non-trivial work in unfamiliar project areas.",
+      "Use portia_search instead when you need broad keyword/history lookup beyond this bounded context pack.",
       "Treat portia_sense results as pointers; follow referenced files and commands before relying on them.",
       "After verified durable findings, use portia_record for project-specific decisions, gotchas, invariants, or pointers.",
     ],

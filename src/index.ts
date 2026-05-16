@@ -2,26 +2,29 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { buildAutopilotContextResult, renderAutopilotGuidance } from "./autopilot.ts";
 import { resolvePortiaSettings } from "./config.ts";
-import { openPortiaDatabase } from "./db.ts";
+import { openPortiaDatabase, openPortiaDatabaseReadOnly } from "./db.ts";
+import { doctorPortia } from "./doctor.ts";
 import { inspectPortiaMemory } from "./inspect.ts";
 import { listPortiaMemories } from "./list.ts";
 import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, recordSenseExposureOnly, shouldWritePheromones } from "./pheromones.ts";
 import type { PheromoneTraceState } from "./pheromones.ts";
+import { reindexPortia } from "./reindex.ts";
 import { repairPortiaMemory } from "./repair.ts";
-import { renderMemoryInspect, renderMemoryList, renderRepair, renderSearch, renderSense, renderStatus, renderTrails } from "./render.ts";
+import { renderDoctor, renderMemoryInspect, renderMemoryList, renderReindex, renderRepair, renderSearch, renderSense, renderStatus, renderTrails } from "./render.ts";
 import { senseMemories } from "./retrieval.ts";
 import { parsePortiaSearchCommandArgs, searchPortiaMemories } from "./search.ts";
 import { listPortiaTrails } from "./trails.ts";
+import { registerPortiaDoctorTool } from "./tools/doctor.ts";
 import { registerPortiaInspectTool } from "./tools/inspect.ts";
 import { registerPortiaListTool } from "./tools/list.ts";
 import { registerPortiaRecordTool } from "./tools/record.ts";
 import { registerPortiaRepairTool } from "./tools/repair.ts";
 import { registerPortiaSearchTool } from "./tools/search.ts";
 import { registerPortiaSenseTool } from "./tools/sense.ts";
-import type { MemoryListStatus, PortiaRepairAction, PortiaSearchInput, PortiaTrailsInput, SenseResult } from "./types.ts";
+import type { MemoryListStatus, PortiaReindexInput, PortiaRepairAction, PortiaSearchInput, PortiaTrailsInput, SenseResult } from "./types.ts";
 import type { PortiaListInput } from "./list.ts";
 
-function parseSenseArgs(args: string): { path: string; query?: string } {
+export function parseSenseArgs(args: string): { path: string; query?: string } {
   const trimmed = args.trim();
   if (!trimmed) return { path: "." };
 
@@ -38,7 +41,7 @@ function parseListStatus(value: string): MemoryListStatus {
   return value === "all" ? "any" : value as MemoryListStatus;
 }
 
-function parseListArgs(args: string): PortiaListInput {
+export function parseListArgs(args: string): PortiaListInput {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const input: PortiaListInput = {};
   let index = 0;
@@ -102,13 +105,13 @@ function parseListArgs(args: string): PortiaListInput {
   return input;
 }
 
-function parseInspectArgs(args: string): { id: string; includeEvents: boolean } {
+export function parseInspectArgs(args: string): { id: string; includeEvents: boolean } {
   const id = args.trim();
   if (!id) throw new Error("Usage: /portia-inspect <memory-id>");
   return { id, includeEvents: true };
 }
 
-function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction; reason: string } {
+export function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction; reason: string } {
   const [id, action, ...rest] = args.trim().split(/\s+/).filter(Boolean);
   const reason = rest.join(" ").trim();
   if (!id || !action || !reason) {
@@ -117,14 +120,21 @@ function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction
   return { id, action: action as PortiaRepairAction, reason };
 }
 
-function parseDeleteArgs(args: string): { id: string; action: "delete"; reason: string; sourceType: string; sourceRef: string } {
+export function parseDeleteArgs(args: string): { id: string; action: "delete"; reason: string; sourceType: string; sourceRef: string } {
   const [id, ...rest] = args.trim().split(/\s+/).filter(Boolean);
   const reason = rest.join(" ").trim();
   if (!id || !reason) throw new Error("Usage: /portia-delete <memory-id> <reason>");
   return { id, action: "delete", reason, sourceType: "command", sourceRef: "/portia-delete" };
 }
 
-function parseTrailsArgs(args: string): PortiaTrailsInput {
+export function parseReindexArgs(args: string): PortiaReindexInput {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return {};
+  if (tokens.length === 1 && ["dry-run", "--dry-run", "check", "preview"].includes(tokens[0].toLowerCase())) return { dryRun: true };
+  throw new Error("Usage: /portia-reindex [dry-run]");
+}
+
+export function parseTrailsArgs(args: string): PortiaTrailsInput {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const input: PortiaTrailsInput = {};
   if (tokens.length === 0) return input;
@@ -193,6 +203,7 @@ export default function (pi: ExtensionAPI) {
   registerPortiaSenseTool(pi);
   registerPortiaRecordTool(pi);
   registerPortiaListTool(pi);
+  registerPortiaDoctorTool(pi);
   registerPortiaSearchTool(pi);
   registerPortiaInspectTool(pi);
   registerPortiaRepairTool(pi);
@@ -309,6 +320,72 @@ export default function (pi: ExtensionAPI) {
           content,
           display: true,
           details: { settings, stats },
+        });
+      } finally {
+        db.close();
+      }
+    },
+  });
+
+  pi.registerCommand("portia-doctor", {
+    description: "Run read-only Portia database health diagnostics for schema, FTS, triggers, and orphaned rows.",
+    handler: async (_args, ctx) => {
+      const settings = resolvePortiaSettings(ctx.cwd);
+      if (!settings.enabled) {
+        pi.sendMessage({
+          customType: "portia",
+          content: "Portia is disabled for this project/session.",
+          display: true,
+          details: { enabled: false, projectRoot: settings.projectRoot, modeOverride: settings.modeOverride },
+        });
+        return;
+      }
+
+      const db = openPortiaDatabaseReadOnly(settings.dbPath);
+      try {
+        const result = doctorPortia(db, settings);
+        pi.sendMessage({
+          customType: "portia",
+          content: renderDoctor(result),
+          display: true,
+          details: result,
+        });
+      } finally {
+        db.close();
+      }
+    },
+  });
+
+  pi.registerCommand("portia-reindex", {
+    description: "Recompute Portia search_terms and rebuild the FTS index: /portia-reindex [dry-run]",
+    handler: async (args, ctx) => {
+      const settings = resolvePortiaSettings(ctx.cwd);
+      if (!settings.enabled) {
+        pi.sendMessage({
+          customType: "portia",
+          content: "Portia is disabled for this project/session.",
+          display: true,
+          details: { enabled: false, projectRoot: settings.projectRoot, modeOverride: settings.modeOverride },
+        });
+        return;
+      }
+
+      let input: PortiaReindexInput;
+      try {
+        input = parseReindexArgs(args);
+      } catch (error) {
+        sendPortiaCommandError(pi, error);
+        return;
+      }
+
+      const db = openPortiaDatabase(settings.dbPath);
+      try {
+        const result = reindexPortia(db, settings, input);
+        pi.sendMessage({
+          customType: "portia",
+          content: renderReindex(result),
+          display: true,
+          details: result,
         });
       } finally {
         db.close();

@@ -20,7 +20,18 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.mjs'"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vihu/pi-portia.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vihu/pi-portia/issues"
+  },
+  "homepage": "https://github.com/vihu/pi-portia#readme",
   "dependencies": {
     "better-sqlite3": "^12.9.0"
   },
@@ -39,7 +50,9 @@
   },
   "files": [
     "README.md",
+    "CHANGELOG.md",
     "package.json",
+    "docs",
     "src"
   ]
 }

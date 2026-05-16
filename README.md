@@ -6,37 +6,51 @@ Portia is a project-local, inspectable memory layer backed by SQLite. It stores 
 
 ## Status
 
-Early MVP.
+Beta.
+
+Portia is usable for day-to-day local project memory. The core workflows are implemented and validated, but the public tool/command surface and maintenance workflows may still change before `v1.0.0`.
 
 Implemented now:
 
 - SQLite database creation and migrations using `better-sqlite3`
 - project-local DB at `.pi/portia/portia.sqlite`
 - `/portia-status`
+- `/portia-doctor`
+- `/portia-reindex [dry-run]`
 - `/portia-sense <path> [query]`
 - `/portia-list` with structured filters, configurable page limits, and cursor pagination
 - `/portia-search <query>` with safe FTS5 search, ranking, snippets, filters, and cursor pagination
 - `/portia-inspect <id>`
 - `/portia-repair <id> <stale|delete|reactivate> <reason>`
 - `/portia-delete <id> <reason>` soft-delete convenience command
+- `/portia-trails` pheromone trail browser
 - `portia_sense` read-only tool
 - `portia_record` write/proposal tool
 - `portia_list` read-only tool
 - `portia_search` read-only tool
+- `portia_doctor` read-only tool
 - `portia_inspect` read-only tool
 - `portia_repair` write/proposal tool
 - turn-local autopilot guidance and bounded context injection
 - automatic pheromone trace capture for exposed/followed/validated memories
 - conservative pheromone-aware retrieval ranking with visible `PHEROMONE` signals
-- `/portia-trails` pheromone trail browser
 - generated search-term expansion for code paths and camelCase identifiers
+- documented SQLite data-location and portability model (no built-in backup/import/export workflow planned for v1)
+- parser, renderer, tool-schema, and migration fixture test coverage
+- changelog plus release, semver, migration, and package checklist documentation
 
-Not implemented yet:
+V1 hardening roadmap:
 
-- export/import
-- reflection/proposal workflow
+- additional search/list polish for long-session ergonomics
+- v1 release-candidate audit and smoke testing
+
+Deferred until measured need:
+
 - vector search
-- public `/portia-reindex` maintenance command
+- trigram accelerator for substring fallback
+- cloud/remote sync
+- automatic broad search on every agent turn
+- rich TUI dashboards
 
 ## Installation
 
@@ -77,7 +91,7 @@ Portia uses a project-local SQLite database:
 .pi/portia/portia.sqlite
 ```
 
-The database is intended to be shared by all agents working in the same checkout. It may still be excluded from Git by a global ignore rule; future export/import commands will support sharing and review across clones.
+The database is the complete Portia data store for the checkout. It is intended to be shared by all agents working in the same checkout and may still be excluded from Git by a global ignore rule. Portia does not add a separate backup/export/import layer for v1; if you need to move a project memory store, move or copy this SQLite file, preferably while Pi is not writing to it or using normal SQLite-safe copy practices.
 
 ## Usage
 
@@ -87,6 +101,9 @@ You can still run explicit commands:
 
 ```text
 /portia-status
+/portia-doctor
+/portia-reindex dry-run
+/portia-reindex
 /portia-sense src/auth token expiry
 /portia-list
 /portia-list all
@@ -112,18 +129,22 @@ You can still run explicit commands:
 
 Tool/command quick reference:
 
-| API                                  | Use for                             | Notes                                                                         |
-| ------------------------------------ | ----------------------------------- | ----------------------------------------------------------------------------- |
-| `portia_sense` / `/portia-sense`     | bounded path/task context           | compact output for agent context; not for exhaustive browsing                 |
-| `portia_search` / `/portia-search`   | explicit keyword search             | safe FTS5 queries, snippets, filters, and cursor pagination                   |
-| `portia_list` / `/portia-list`       | structured inventory/audit browsing | status/kind/scope/query filters, configurable limits, and cursor pagination   |
-| `portia_inspect` / `/portia-inspect` | full details for one memory         | provenance, event history, and pheromone summary                              |
-| `portia_record`                      | write or propose durable memories   | honors `writePolicy`/`workerWritePolicy`                                      |
-| `portia_repair` / `/portia-repair`   | soft-repair memory status           | marks stale/deleted/active without physical deletion                          |
+| API                                  | Use for                             | Notes                                                                             |
+| ------------------------------------ | ----------------------------------- | --------------------------------------------------------------------------------- |
+| `portia_sense` / `/portia-sense`     | bounded path/task context           | compact output for agent context; not for exhaustive browsing                     |
+| `portia_search` / `/portia-search`   | explicit keyword search             | safe FTS5 queries, snippets, filters, and cursor pagination                       |
+| `portia_list` / `/portia-list`       | structured inventory/audit browsing | status/kind/scope/query filters, configurable limits, and cursor pagination       |
+| `portia_doctor` / `/portia-doctor`   | database health diagnostics         | read-only checks for schema, FTS, triggers, search terms, and orphaned rows       |
+| `/portia-reindex`                    | search index maintenance            | command-only; recomputes `search_terms` and rebuilds FTS when write policy allows |
+| `portia_inspect` / `/portia-inspect` | full details for one memory         | provenance, event history, and pheromone summary                                  |
+| `portia_record`                      | write or propose durable memories   | honors `writePolicy`/`workerWritePolicy`                                          |
+| `portia_repair` / `/portia-repair`   | soft-repair memory status           | marks stale/deleted/active without physical deletion                              |
+
+For more detailed agent guidance, see [`docs/agent-usage.md`](docs/agent-usage.md).
 
 `portia_sense` returns compact memories with ids, scopes, kinds, and retrieval signals. Use it for bounded path/task context before unfamiliar work. Treat the output as pointers to re-read source files and commands, not as complete ground truth. When pheromones are enabled, reinforced memories may receive a bounded `PHEROMONE` boost, but only after they were already selected by normal proximity/dependency/FTS candidate generation.
 
-Use `portia_search`/`/portia-search` for explicit keyword search across memories, especially in long sessions where `portia_sense` is intentionally too bounded. Search supports status, kind, scope, ordering, match mode, substring fallback, configurable page limits, and opaque cursor pagination. Use the returned `nextCursor` with the same query and filters to continue browsing additional pages; cursors validate against the original query/filter fingerprint and do not store the full query.
+Use `portia_search`/`/portia-search` for explicit keyword search across memories, especially in long sessions where `portia_sense` is intentionally too bounded. Search is the right tool for prior decisions, old validation notes, package names, error strings, and broad concept recall. Search supports status, kind, scope, ordering, match mode, substring fallback, configurable page limits, and opaque cursor pagination. Use the returned `nextCursor` with the same query and filters to continue browsing additional pages; cursors validate against the original query/filter fingerprint and do not store the full query.
 
 Search query text is plain input, not raw FTS syntax. Portia quotes search terms before sending them to SQLite FTS5, so code-like literals such as `/portia-list`, `src/config.ts`, `foo:bar`, `-6`, and words like `AND`/`OR` are treated safely instead of as operators. Default `matchMode` is `all`; use `match any` for broader recall or `match phrase` for an exact phrase. Generated `search_terms` help component searches find code/camelCase text such as `maxSenseResults` from `max sense results`.
 
@@ -141,7 +162,9 @@ Record a Portia memory: scope src/auth, kind gotcha, title Auth fixtures, body L
 
 Use `sourceType` and `sourceRef` for provenance. When promoting an observational-memory fact, set `sourceType` to `observation` or `reflection` and put the observation/reflection id in `sourceRef`.
 
-The FTS index is maintained by SQLite triggers. Schema migrations rebuild the external-content FTS index when indexed columns change, including the generated `search_terms` column used for code/camelCase search expansion. There is no public `/portia-reindex` command yet; reindexing is currently internal migration/maintenance behavior.
+Use `portia_doctor`/`/portia-doctor` for read-only health diagnostics. Doctor checks the schema version, expected tables/columns, FTS availability and row consistency, FTS maintenance triggers, null `search_terms`, orphaned event/pheromone/trace/edge rows, foreign-key integrity, and DB path. It reports warnings/errors only; it does not mutate the database.
+
+The FTS index is maintained by SQLite triggers. Schema migrations rebuild the external-content FTS index when indexed columns change, including the generated `search_terms` column used for code/camelCase search expansion. Use `/portia-reindex dry-run` to preview search maintenance and `/portia-reindex` to recompute all generated `search_terms` and rebuild `memory_fts`. Reindex honors the effective write policy; if policy is not `write`, it reports what would happen without applying changes.
 
 ## Settings
 
@@ -240,6 +263,10 @@ Pheromone settings:
 Pheromones adjust salience of existing active memories. They do not create new semantic memories automatically.
 
 ## Development
+
+`pi-portia` supports Node.js 22 or newer; CI validates Node 22 and 24.
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for release notes and [`docs/release.md`](./docs/release.md) for the release checklist, semver policy, and migration/data-location policy.
 
 ```bash
 npm run typecheck

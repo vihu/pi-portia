@@ -359,6 +359,59 @@ export interface MemorySearchResult {
   page: PortiaSearchPage;
 }
 
+export type PortiaDoctorStatus = "ok" | "warning" | "error";
+
+export interface PortiaDoctorCheck {
+  name: string;
+  status: PortiaDoctorStatus;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface PortiaDoctorSummary {
+  ok: number;
+  warnings: number;
+  errors: number;
+}
+
+export interface PortiaDoctorResult {
+  projectRoot: string;
+  dbPath: string;
+  enabled: boolean;
+  schemaVersion: number;
+  settings: {
+    writePolicy: string;
+    effectiveWritePolicy: string;
+    enableFts: boolean;
+    enablePheromones: boolean;
+  };
+  summary: PortiaDoctorSummary;
+  checks: PortiaDoctorCheck[];
+}
+
+export interface PortiaReindexInput {
+  dryRun?: boolean;
+}
+
+export interface PortiaReindexStats {
+  memoryCount: number;
+  nullSearchTerms: number;
+  ftsRows?: number;
+}
+
+export interface PortiaReindexResult {
+  projectRoot: string;
+  dbPath: string;
+  dryRun: boolean;
+  written: boolean;
+  writePolicy: string;
+  before: PortiaReindexStats;
+  after?: PortiaReindexStats;
+  recomputedSearchTerms: number;
+  rebuiltFts: boolean;
+  warnings: string[];
+}
+
 export interface PortiaInspectInput {
   id: string;
   includeEvents?: boolean;
