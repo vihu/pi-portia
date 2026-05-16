@@ -24,7 +24,7 @@ import { registerPortiaSenseTool } from "./tools/sense.ts";
 import type { MemoryListStatus, PortiaReindexInput, PortiaRepairAction, PortiaSearchInput, PortiaTrailsInput, SenseResult } from "./types.ts";
 import type { PortiaListInput } from "./list.ts";
 
-function parseSenseArgs(args: string): { path: string; query?: string } {
+export function parseSenseArgs(args: string): { path: string; query?: string } {
   const trimmed = args.trim();
   if (!trimmed) return { path: "." };
 
@@ -41,7 +41,7 @@ function parseListStatus(value: string): MemoryListStatus {
   return value === "all" ? "any" : value as MemoryListStatus;
 }
 
-function parseListArgs(args: string): PortiaListInput {
+export function parseListArgs(args: string): PortiaListInput {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const input: PortiaListInput = {};
   let index = 0;
@@ -105,13 +105,13 @@ function parseListArgs(args: string): PortiaListInput {
   return input;
 }
 
-function parseInspectArgs(args: string): { id: string; includeEvents: boolean } {
+export function parseInspectArgs(args: string): { id: string; includeEvents: boolean } {
   const id = args.trim();
   if (!id) throw new Error("Usage: /portia-inspect <memory-id>");
   return { id, includeEvents: true };
 }
 
-function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction; reason: string } {
+export function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction; reason: string } {
   const [id, action, ...rest] = args.trim().split(/\s+/).filter(Boolean);
   const reason = rest.join(" ").trim();
   if (!id || !action || !reason) {
@@ -120,21 +120,21 @@ function parseRepairArgs(args: string): { id: string; action: PortiaRepairAction
   return { id, action: action as PortiaRepairAction, reason };
 }
 
-function parseDeleteArgs(args: string): { id: string; action: "delete"; reason: string; sourceType: string; sourceRef: string } {
+export function parseDeleteArgs(args: string): { id: string; action: "delete"; reason: string; sourceType: string; sourceRef: string } {
   const [id, ...rest] = args.trim().split(/\s+/).filter(Boolean);
   const reason = rest.join(" ").trim();
   if (!id || !reason) throw new Error("Usage: /portia-delete <memory-id> <reason>");
   return { id, action: "delete", reason, sourceType: "command", sourceRef: "/portia-delete" };
 }
 
-function parseReindexArgs(args: string): PortiaReindexInput {
+export function parseReindexArgs(args: string): PortiaReindexInput {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return {};
   if (tokens.length === 1 && ["dry-run", "--dry-run", "check", "preview"].includes(tokens[0].toLowerCase())) return { dryRun: true };
   throw new Error("Usage: /portia-reindex [dry-run]");
 }
 
-function parseTrailsArgs(args: string): PortiaTrailsInput {
+export function parseTrailsArgs(args: string): PortiaTrailsInput {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const input: PortiaTrailsInput = {};
   if (tokens.length === 0) return input;

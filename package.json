@@ -20,6 +20,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.mjs'"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "license": "MIT",
   "dependencies": {
     "better-sqlite3": "^12.9.0"

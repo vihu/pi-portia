@@ -15,7 +15,7 @@ export function registerPortiaDoctorTool(pi: ExtensionAPI): void {
     promptSnippet: "Check Portia database health and maintenance readiness",
     promptGuidelines: [
       "Use portia_doctor when diagnosing Portia DB, schema, FTS, trigger, search_terms, or orphaned-row issues.",
-      "portia_doctor is read-only; use maintenance commands such as reindex/export/import only when explicitly available and appropriate.",
+      "portia_doctor is read-only; use maintenance commands such as /portia-reindex only when explicitly appropriate.",
       "Treat warnings and errors as diagnostics; inspect source or run maintenance before assuming memories are lost.",
     ],
     parameters: PortiaDoctorParams,

@@ -36,11 +36,11 @@ Implemented now:
 - conservative pheromone-aware retrieval ranking with visible `PHEROMONE` signals
 - generated search-term expansion for code paths and camelCase identifiers
 - documented SQLite data-location and portability model (no built-in backup/import/export workflow planned for v1)
+- parser, renderer, tool-schema, and migration fixture test coverage
 
 V1 hardening roadmap:
 
-- search/list polish for long-session ergonomics
-- broader parser/renderer/tool-schema and migration fixture tests
+- additional search/list polish for long-session ergonomics
 - semver, migration, release, and changelog documentation
 
 Deferred until measured need:
@@ -262,6 +262,8 @@ Pheromone settings:
 Pheromones adjust salience of existing active memories. They do not create new semantic memories automatically.
 
 ## Development
+
+`pi-portia` supports Node.js 22 or newer; CI validates Node 22 and 24.
 
 ```bash
 npm run typecheck
