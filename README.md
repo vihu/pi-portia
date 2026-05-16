@@ -8,7 +8,7 @@ Portia is a project-local, inspectable memory layer backed by SQLite. It stores 
 
 Beta.
 
-Portia is usable for day-to-day local project memory. The core workflows are implemented and validated, but the public tool/command surface and maintenance workflows may still change before `v1.0.0`. In this development checkout, the beta-to-v1 roadmap is tracked in `.ai-docs/PLAN-portia-beta-v1-roadmap.md` and `.ai-docs/TASK-portia-beta-v1-roadmap.md`.
+Portia is usable for day-to-day local project memory. The core workflows are implemented and validated, but the public tool/command surface and maintenance workflows may still change before `v1.0.0`.
 
 Implemented now:
 
@@ -37,11 +37,12 @@ Implemented now:
 - generated search-term expansion for code paths and camelCase identifiers
 - documented SQLite data-location and portability model (no built-in backup/import/export workflow planned for v1)
 - parser, renderer, tool-schema, and migration fixture test coverage
+- changelog plus release, semver, migration, and package checklist documentation
 
 V1 hardening roadmap:
 
 - additional search/list polish for long-session ergonomics
-- semver, migration, release, and changelog documentation
+- v1 release-candidate audit and smoke testing
 
 Deferred until measured need:
 
@@ -264,6 +265,8 @@ Pheromones adjust salience of existing active memories. They do not create new s
 ## Development
 
 `pi-portia` supports Node.js 22 or newer; CI validates Node 22 and 24.
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for release notes and [`docs/release.md`](./docs/release.md) for the release checklist, semver policy, and migration/data-location policy.
 
 ```bash
 npm run typecheck
