@@ -4,15 +4,15 @@ Portia memories are durable project-local pointers. They help an agent re-percei
 
 ## Tool choice
 
-| Need | Use | Why |
-| --- | --- | --- |
-| Bounded context for a path/task before unfamiliar work | `portia_sense` | Small spatial/context pack designed for agent prompts. |
-| Broad keyword or historical recall | `portia_search` | FTS-backed search with snippets, filters, and cursor pagination. |
-| Inventory or audit browsing | `portia_list` | Structured status/kind/scope/query filters over stored memories. |
-| Database health diagnostics | `portia_doctor` | Read-only checks for schema, FTS, triggers, search terms, and orphaned rows. |
-| Full provenance or event history for one memory | `portia_inspect` | Shows source, status, event history, and pheromone summary. |
-| Persist a verified project fact | `portia_record` | Records or proposes durable pointers, decisions, gotchas, patterns, invariants, purpose, and plans. |
-| Hide, stale, or reactivate a memory | `portia_repair` | Soft status repair with auditable memory events. |
+| Need                                                   | Use              | Why                                                                                                 |
+| ------------------------------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------- |
+| Bounded context for a path/task before unfamiliar work | `portia_sense`   | Small spatial/context pack designed for agent prompts.                                              |
+| Broad keyword or historical recall                     | `portia_search`  | FTS-backed search with snippets, filters, and cursor pagination.                                    |
+| Inventory or audit browsing                            | `portia_list`    | Structured status/kind/scope/query filters over stored memories.                                    |
+| Database health diagnostics                            | `portia_doctor`  | Read-only checks for schema, FTS, triggers, search terms, and orphaned rows.                        |
+| Full provenance or event history for one memory        | `portia_inspect` | Shows source, status, event history, and pheromone summary.                                         |
+| Persist a verified project fact                        | `portia_record`  | Records or proposes durable pointers, decisions, gotchas, patterns, invariants, purpose, and plans. |
+| Hide, stale, or reactivate a memory                    | `portia_repair`  | Soft status repair with auditable memory events.                                                    |
 
 ## Recommended flow
 
@@ -79,6 +79,10 @@ Use `portia_list` for inventory/audit browsing. Its `query` filter is a simple s
 Doctor is read-only. Use it when diagnosing schema version, FTS index, trigger, search-term, foreign-key, or orphaned-row issues. Treat warnings/errors as maintenance signals; do not assume memories are lost without inspecting the DB or running the appropriate maintenance command.
 
 `/portia-reindex` is command-only maintenance. It recomputes generated `search_terms` and rebuilds the FTS index when the effective write policy is `write`. Use `dry-run` first when investigating or when the policy is not writable.
+
+## Data location and portability
+
+Portia stores all project-local data in `.pi/portia/portia.sqlite`. There is no `portia_export`, `portia_import`, or `portia_backup` workflow for normal v1 use. If a user asks how to move Portia data between checkouts or machines, point them at that SQLite file rather than inventing a logical export/import flow. Prefer copying it while Pi is not actively writing to it, or use normal SQLite-safe copy practices.
 
 ## Recording guidance
 

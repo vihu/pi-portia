@@ -35,10 +35,10 @@ Implemented now:
 - automatic pheromone trace capture for exposed/followed/validated memories
 - conservative pheromone-aware retrieval ranking with visible `PHEROMONE` signals
 - generated search-term expansion for code paths and camelCase identifiers
+- documented SQLite data-location and portability model (no built-in backup/import/export workflow planned for v1)
 
 V1 hardening roadmap:
 
-- export/backup and safe import/restore workflows
 - search/list polish for long-session ergonomics
 - broader parser/renderer/tool-schema and migration fixture tests
 - semver, migration, release, and changelog documentation
@@ -90,7 +90,7 @@ Portia uses a project-local SQLite database:
 .pi/portia/portia.sqlite
 ```
 
-The database is intended to be shared by all agents working in the same checkout. It may still be excluded from Git by a global ignore rule; future export/import commands will support sharing and review across clones.
+The database is the complete Portia data store for the checkout. It is intended to be shared by all agents working in the same checkout and may still be excluded from Git by a global ignore rule. Portia does not add a separate backup/export/import layer for v1; if you need to move a project memory store, move or copy this SQLite file, preferably while Pi is not writing to it or using normal SQLite-safe copy practices.
 
 ## Usage
 
@@ -128,16 +128,16 @@ You can still run explicit commands:
 
 Tool/command quick reference:
 
-| API                                  | Use for                             | Notes                                                                         |
-| ------------------------------------ | ----------------------------------- | ----------------------------------------------------------------------------- |
-| `portia_sense` / `/portia-sense`     | bounded path/task context           | compact output for agent context; not for exhaustive browsing                 |
-| `portia_search` / `/portia-search`   | explicit keyword search             | safe FTS5 queries, snippets, filters, and cursor pagination                   |
-| `portia_list` / `/portia-list`       | structured inventory/audit browsing | status/kind/scope/query filters, configurable limits, and cursor pagination   |
-| `portia_doctor` / `/portia-doctor`   | database health diagnostics         | read-only checks for schema, FTS, triggers, search terms, and orphaned rows   |
+| API                                  | Use for                             | Notes                                                                             |
+| ------------------------------------ | ----------------------------------- | --------------------------------------------------------------------------------- |
+| `portia_sense` / `/portia-sense`     | bounded path/task context           | compact output for agent context; not for exhaustive browsing                     |
+| `portia_search` / `/portia-search`   | explicit keyword search             | safe FTS5 queries, snippets, filters, and cursor pagination                       |
+| `portia_list` / `/portia-list`       | structured inventory/audit browsing | status/kind/scope/query filters, configurable limits, and cursor pagination       |
+| `portia_doctor` / `/portia-doctor`   | database health diagnostics         | read-only checks for schema, FTS, triggers, search terms, and orphaned rows       |
 | `/portia-reindex`                    | search index maintenance            | command-only; recomputes `search_terms` and rebuilds FTS when write policy allows |
-| `portia_inspect` / `/portia-inspect` | full details for one memory         | provenance, event history, and pheromone summary                              |
-| `portia_record`                      | write or propose durable memories   | honors `writePolicy`/`workerWritePolicy`                                      |
-| `portia_repair` / `/portia-repair`   | soft-repair memory status           | marks stale/deleted/active without physical deletion                          |
+| `portia_inspect` / `/portia-inspect` | full details for one memory         | provenance, event history, and pheromone summary                                  |
+| `portia_record`                      | write or propose durable memories   | honors `writePolicy`/`workerWritePolicy`                                          |
+| `portia_repair` / `/portia-repair`   | soft-repair memory status           | marks stale/deleted/active without physical deletion                              |
 
 For more detailed agent guidance, see [`docs/agent-usage.md`](docs/agent-usage.md).
 
