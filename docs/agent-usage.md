@@ -18,11 +18,13 @@ Portia memories are durable project-local pointers. They help an agent re-percei
 
 1. Start non-trivial unfamiliar work with `portia_sense` on the relevant path and task query.
 2. If you need broader recall by concept, old decision, error text, package name, or feature name, use `portia_search`.
-3. If you need to audit what exists before recording or repairing memory, use `portia_list`.
-4. If Portia retrieval or persistence seems unhealthy, use `portia_doctor` before manual SQLite inspection.
-5. Before relying on a memory for provenance-sensitive work, use `portia_inspect` or verify the referenced files/commands directly.
-6. After durable findings are verified, use `portia_record` with concise body text and explicit provenance.
-7. Use `portia_repair` only for verified stale, bad, test, duplicate, or revalidated memories.
+3. If autopilot adds a `Portia Historical Recall Preview`, treat it as a small pointer pack, not proof; verify source/provenance before relying on it.
+4. If autopilot adds a `Portia historical recall suggestion`, strongly consider calling `portia_search` with the suggested query/filter parameters before answering.
+5. If you need to audit what exists before recording or repairing memory, use `portia_list`.
+6. If Portia retrieval or persistence seems unhealthy, use `portia_doctor` before manual SQLite inspection.
+7. Before relying on a memory for provenance-sensitive work, use `portia_inspect` or verify the referenced files/commands directly.
+8. After durable findings are verified, use `portia_record` with concise body text and explicit provenance.
+9. Use `portia_repair` only for verified stale, bad, test, duplicate, or revalidated memories.
 
 ## When `portia_search` is better than `portia_sense`
 
@@ -34,7 +36,18 @@ Use `portia_search` when the question is about memory history rather than immedi
 - "Search all memories for a package name, error string, or old command."
 - "Find deleted/stale/superseded memories related to a topic."
 
-`portia_sense` may internally use bounded FTS chord retrieval, but it is intentionally compact and does not invoke the full `portia_search` service. Do not keep raising `portia_sense` limits to browse memory history; switch to `portia_search` or `portia_list`.
+`portia_sense` may internally use bounded FTS chord retrieval, but it is intentionally compact and does not replace the full `portia_search` service. Do not keep raising `portia_sense` limits to browse memory history; switch to `portia_search` or `portia_list`.
+
+## Autopilot historical recall assist
+
+When enabled, Portia autopilot can detect search-shaped turns and add one or both of these sections:
+
+- `Portia Historical Recall Preview`: a tiny internal search preview for high-confidence historical/provenance/audit prompts in default `assist` mode. It is bounded, omits DB/cursor/page noise, suppresses no-hit output, and contains pointers only.
+- `Portia historical recall suggestion`: concrete `portia_search` parameters for the current turn. Use the suggestion when you need broader recall than the preview or when no preview was injected.
+
+Default `autoSearchMode` is `assist`: medium-confidence historical prompts get only the suggestion, while high-confidence prompts can get the compact preview plus the suggestion. `suggest` disables internal search previews, `context` allows previews for more detected prompts, and `off` disables this search assist entirely.
+
+Automatic search defaults to `status: "active"`. Use `status: "any"` only when the task is explicitly about stale, deleted, superseded, repaired, reactivated, inactive, or all-status memory history.
 
 ## Search examples
 

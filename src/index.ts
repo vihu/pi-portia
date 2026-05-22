@@ -1,12 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { buildAutopilotContextResult, renderAutopilotGuidance } from "./autopilot.ts";
+import { buildAutopilotContextResult, buildAutopilotSearchPreviewResult, buildAutopilotSearchSuggestion, renderAutopilotGuidance, renderAutopilotSearchSuggestion, shouldBuildAutopilotSearchPreview } from "./autopilot.ts";
 import { resolvePortiaSettings } from "./config.ts";
 import { openPortiaDatabase, openPortiaDatabaseReadOnly } from "./db.ts";
 import { doctorPortia } from "./doctor.ts";
 import { inspectPortiaMemory } from "./inspect.ts";
 import { listPortiaMemories } from "./list.ts";
-import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, recordSenseExposureOnly, shouldWritePheromones } from "./pheromones.ts";
+import { addSearchExposures, addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, recordSenseExposureOnly, shouldWritePheromones } from "./pheromones.ts";
 import type { PheromoneTraceState } from "./pheromones.ts";
 import { reindexPortia } from "./reindex.ts";
 import { repairPortiaMemory } from "./repair.ts";
@@ -21,7 +21,7 @@ import { registerPortiaRecordTool } from "./tools/record.ts";
 import { registerPortiaRepairTool } from "./tools/repair.ts";
 import { registerPortiaSearchTool } from "./tools/search.ts";
 import { registerPortiaSenseTool } from "./tools/sense.ts";
-import type { MemoryListStatus, PortiaReindexInput, PortiaRepairAction, PortiaSearchInput, PortiaTrailsInput, SenseResult } from "./types.ts";
+import type { MemoryListStatus, PortiaReindexInput, PortiaRepairAction, PortiaSearchInput, PortiaSearchOutput, PortiaTrailsInput, SenseResult } from "./types.ts";
 import type { PortiaListInput } from "./list.ts";
 
 export function parseSenseArgs(args: string): { path: string; query?: string } {
@@ -175,6 +175,12 @@ function isSenseResult(value: unknown): value is SenseResult {
   return Array.isArray(candidate.memories) && typeof candidate.targetScope === "string";
 }
 
+function isSearchResult(value: unknown): value is PortiaSearchOutput {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { hits?: unknown; filters?: { query?: unknown } };
+  return Array.isArray(candidate.hits) && typeof candidate.filters?.query === "string";
+}
+
 function appendPromptSection(systemPrompt: string, section: string): string {
   return `${systemPrompt}\n\n${section}`;
 }
@@ -219,22 +225,48 @@ export default function (pi: ExtensionAPI) {
     const guidance = renderAutopilotGuidance(settings);
     if (guidance) sections.push(guidance);
 
-    if (settings.autoSense) {
+    const searchSuggestion = buildAutopilotSearchSuggestion(settings, event.prompt, ctx.cwd);
+    const shouldSearchPreview = shouldBuildAutopilotSearchPreview(settings, searchSuggestion);
+
+    if (settings.autoSense || shouldSearchPreview) {
       try {
         const db = openPortiaDatabase(settings.dbPath);
         try {
-          const context = buildAutopilotContextResult(db, settings, event.prompt, ctx.cwd);
-          if (context) {
-            sections.push(context.rendered);
-            if (currentTrace) addSenseExposures(currentTrace, context.result, "autopilot");
+          const exposedMemoryIds = new Set<string>();
+
+          if (settings.autoSense) {
+            const context = buildAutopilotContextResult(db, settings, event.prompt, ctx.cwd);
+            if (context) {
+              sections.push(context.rendered);
+              for (const memory of context.result.memories) exposedMemoryIds.add(memory.id);
+              if (currentTrace) addSenseExposures(currentTrace, context.result, "autopilot");
+            }
+          }
+
+          if (shouldSearchPreview) {
+            const preview = buildAutopilotSearchPreviewResult(db, settings, event.prompt, ctx.cwd, {
+              suggestion: searchSuggestion,
+              excludeMemoryIds: exposedMemoryIds,
+            });
+            if (preview) {
+              sections.push(preview.rendered);
+              if (currentTrace) addSearchExposures(currentTrace, preview.result, "auto_search");
+            }
           }
         } finally {
           db.close();
         }
       } catch {
-        // Autopilot context must never break the user turn. Manual /portia-status
-        // and /portia-sense still surface DB/retrieval failures explicitly.
+        // Autopilot context/search must never break the user turn. Manual
+        // /portia-status, /portia-sense, and /portia-search still surface
+        // DB/retrieval failures explicitly.
       }
+    }
+
+    if (searchSuggestion && settings.autoPromptGuidance) {
+      const toolAvailable = event.systemPromptOptions.selectedTools?.includes("portia_search") ?? true;
+      const renderedSuggestion = renderAutopilotSearchSuggestion(searchSuggestion, { toolAvailable });
+      if (renderedSuggestion) sections.push(renderedSuggestion);
     }
 
     if (sections.length === 0) return;
@@ -274,6 +306,9 @@ export default function (pi: ExtensionAPI) {
     for (const toolResult of event.toolResults) {
       if (toolResult.toolName === "portia_sense" && isSenseResult(toolResult.details)) {
         addSenseExposures(currentTrace, toolResult.details, "portia_sense");
+      }
+      if (toolResult.toolName === "portia_search" && isSearchResult(toolResult.details)) {
+        addSearchExposures(currentTrace, toolResult.details, "portia_search");
       }
     }
   });

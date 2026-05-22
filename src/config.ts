@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { findProjectRoot } from "./root.ts";
-import type { PheromoneWorkerPolicy, PortiaMode, PortiaSettings, WritePolicy } from "./types.ts";
+import type { PheromoneWorkerPolicy, PortiaAutoSearchMode, PortiaMode, PortiaSettings, WritePolicy } from "./types.ts";
 
 const SETTINGS_KEY = "portia";
 const DEFAULT_DB_PATH = ".pi/portia/portia.sqlite";
@@ -27,6 +27,9 @@ interface PartialPortiaSettings {
   autoSense?: boolean;
   autoSenseMaxResults?: number;
   autoSenseMaxChars?: number;
+  autoSearchMode?: PortiaAutoSearchMode;
+  autoSearchMaxResults?: number;
+  autoSearchMaxChars?: number;
   enablePheromones?: boolean;
   pheromoneRanking?: boolean;
   pheromoneHalfLifeDays?: number;
@@ -79,6 +82,11 @@ function parseMode(value: unknown): PortiaMode | undefined {
 
 function parsePheromoneWorkerPolicy(value: unknown): PheromoneWorkerPolicy | undefined {
   if (value === "off" || value === "low" || value === "write") return value;
+  return undefined;
+}
+
+function parseAutoSearchMode(value: unknown): PortiaAutoSearchMode | undefined {
+  if (value === "off" || value === "suggest" || value === "assist" || value === "context") return value;
   return undefined;
 }
 
@@ -140,6 +148,15 @@ function parseSettingsFile(filePath: string): PartialPortiaSettings {
 
   const autoSenseMaxChars = parsePositiveInteger(input.autoSenseMaxChars);
   if (autoSenseMaxChars) settings.autoSenseMaxChars = Math.min(autoSenseMaxChars, 12_000);
+
+  const autoSearchMode = parseAutoSearchMode(input.autoSearchMode);
+  if (autoSearchMode) settings.autoSearchMode = autoSearchMode;
+
+  const autoSearchMaxResults = parsePositiveInteger(input.autoSearchMaxResults);
+  if (autoSearchMaxResults) settings.autoSearchMaxResults = Math.min(autoSearchMaxResults, 12);
+
+  const autoSearchMaxChars = parsePositiveInteger(input.autoSearchMaxChars);
+  if (autoSearchMaxChars) settings.autoSearchMaxChars = Math.min(autoSearchMaxChars, 8_000);
 
   const enablePheromones = parseBoolean(input.enablePheromones);
   if (enablePheromones !== undefined) settings.enablePheromones = enablePheromones;
@@ -206,6 +223,9 @@ export function resolvePortiaSettings(cwd: string): PortiaSettings {
     autoSense: true,
     autoSenseMaxResults: 5,
     autoSenseMaxChars: 2_500,
+    autoSearchMode: "assist" as PortiaAutoSearchMode,
+    autoSearchMaxResults: 5,
+    autoSearchMaxChars: 900,
     enablePheromones: true,
     pheromoneRanking: true,
     pheromoneHalfLifeDays: 30,
