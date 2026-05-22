@@ -4,6 +4,7 @@ import { isPathInside, normalizeScopePath, toProjectRelative } from "./root.ts";
 import type {
   MemoryRecord,
   PheromoneTraceEventType,
+  PortiaSearchOutput,
   PortiaSettings,
   SenseResult,
 } from "./types.ts";
@@ -11,11 +12,19 @@ import type {
 const MAX_PROMPT_PAYLOAD_CHARS = 500;
 const LOW_WORKER_MULTIPLIER = 0.25;
 
+export type TraceExposureSource = "autopilot" | "portia_sense" | "command" | "portia_search" | "auto_search";
+export type SearchTraceExposureSource = "portia_search" | "auto_search";
+
 interface TraceExposure {
   memoryId: string;
-  source: "autopilot" | "portia_sense" | "command";
+  source: TraceExposureSource;
   targetScope: string;
   query?: string;
+  status?: string;
+  searchScopePath?: string;
+  scopeMode?: string;
+  matchMode?: string;
+  rank?: number;
   index: number;
 }
 
@@ -224,7 +233,7 @@ export function createPheromoneTraceState(settings: PortiaSettings, prompt: stri
   };
 }
 
-export function addSenseExposures(state: PheromoneTraceState, result: SenseResult, source: TraceExposure["source"]): void {
+export function addSenseExposures(state: PheromoneTraceState, result: SenseResult, source: Extract<TraceExposureSource, "autopilot" | "portia_sense" | "command">): void {
   for (const memory of result.memories) {
     state.exposures.push({
       memoryId: memory.id,
@@ -234,6 +243,23 @@ export function addSenseExposures(state: PheromoneTraceState, result: SenseResul
       index: nextIndex(state),
     });
   }
+}
+
+export function addSearchExposures(state: PheromoneTraceState, result: PortiaSearchOutput, source: SearchTraceExposureSource): void {
+  result.hits.forEach((hit, rank) => {
+    state.exposures.push({
+      memoryId: hit.memory.id,
+      source,
+      targetScope: hit.memory.scopePath || result.filters.scopePath || ".",
+      query: result.filters.query,
+      status: result.filters.status,
+      searchScopePath: result.filters.scopePath,
+      scopeMode: result.filters.scopeMode,
+      matchMode: result.filters.matchMode,
+      rank,
+      index: nextIndex(state),
+    });
+  });
 }
 
 export function observeToolCall(state: PheromoneTraceState, observation: ToolCallObservation): void {
@@ -301,6 +327,11 @@ export function flushPheromoneTraceState(db: PortiaDatabase, settings: PortiaSet
         source: exposure.source,
         targetScope: exposure.targetScope,
         query: exposure.query,
+        status: exposure.status,
+        searchScopePath: exposure.searchScopePath,
+        scopeMode: exposure.scopeMode,
+        matchMode: exposure.matchMode,
+        rank: exposure.rank,
         prompt: truncate(state.prompt.replace(/\s+/g, " ").trim(), MAX_PROMPT_PAYLOAD_CHARS),
       },
       createdAt: flushAt,
@@ -323,6 +354,12 @@ export function flushPheromoneTraceState(db: PortiaDatabase, settings: PortiaSet
         payload: {
           source: earliestExposure.source,
           targetScope: earliestExposure.targetScope,
+          query: earliestExposure.query,
+          status: earliestExposure.status,
+          searchScopePath: earliestExposure.searchScopePath,
+          scopeMode: earliestExposure.scopeMode,
+          matchMode: earliestExposure.matchMode,
+          rank: earliestExposure.rank,
         },
         createdAt: flushAt,
       });
@@ -340,6 +377,12 @@ export function flushPheromoneTraceState(db: PortiaDatabase, settings: PortiaSet
       payload: {
         source: earliestExposure.source,
         targetScope: earliestExposure.targetScope,
+        query: earliestExposure.query,
+        status: earliestExposure.status,
+        searchScopePath: earliestExposure.searchScopePath,
+        scopeMode: earliestExposure.scopeMode,
+        matchMode: earliestExposure.matchMode,
+        rank: earliestExposure.rank,
         followedScope: follow.touch.scopePath,
         followMode: follow.touch.mode,
       },

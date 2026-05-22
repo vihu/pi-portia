@@ -4,13 +4,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { buildAutopilotContext, extractPromptPathCandidates, renderAutopilotGuidance, selectAutopilotTarget } from "../src/autopilot.ts";
+import { buildAutopilotContext, buildAutopilotSearchPreviewResult, buildAutopilotSearchSuggestion, extractPromptPathCandidates, renderAutopilotGuidance, renderAutopilotSearchSuggestion, selectAutopilotTarget, shouldBuildAutopilotSearchPreview } from "../src/autopilot.ts";
 import { resolvePortiaSettings } from "../src/config.ts";
 import { openPortiaDatabase, openPortiaDatabaseReadOnly, PortiaDatabase } from "../src/db.ts";
 import { doctorPortia } from "../src/doctor.ts";
 import { inspectPortiaMemory } from "../src/inspect.ts";
 import { listPortiaMemories } from "../src/list.ts";
-import { addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, shouldWritePheromones } from "../src/pheromones.ts";
+import { addSearchExposures, addSenseExposures, createPheromoneTraceState, flushPheromoneTraceState, observeToolCall, observeToolResult, shouldWritePheromones } from "../src/pheromones.ts";
 import { recordPortiaMemory } from "../src/record.ts";
 import { reindexPortia } from "../src/reindex.ts";
 import { repairPortiaMemory } from "../src/repair.ts";
@@ -80,6 +80,9 @@ function settings(projectRoot, dbPath, overrides = {}) {
     autoSense: true,
     autoSenseMaxResults: 5,
     autoSenseMaxChars: 2500,
+    autoSearchMode: "assist",
+    autoSearchMaxResults: 5,
+    autoSearchMaxChars: 900,
     enablePheromones: true,
     pheromoneRanking: true,
     pheromoneHalfLifeDays: 30,
@@ -758,6 +761,55 @@ test("pheromone trace events update summary counts without exposure self-reinfor
     assert.equal(pheromone.ignoredCount, 1);
     assert.equal(db.getTraceEventsForMemory(memory.id).length, 2);
     assert.equal(db.getStats().pheromoneTraceEvents, 2);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("search pheromone exposures record search metadata without self-reinforcement", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const writeSettings = settings(project, dbPath, {
+      writePolicy: "write",
+      effectiveWritePolicy: "write",
+    });
+    const memory = recordPortiaMemory(db, writeSettings, {
+      scopePath: "src/search.ts",
+      kind: "decision",
+      title: "Search exposure fixture",
+      body: "Search exposure tracing records portia_search metadata without strengthening on exposure alone.",
+    }, project).memory;
+
+    const search = searchPortiaMemories(db, writeSettings, {
+      query: "search exposure tracing",
+      matchMode: "any",
+      limit: 5,
+    }, project);
+    assert.equal(search.hits.some((hit) => hit.memory.id === memory.id), true);
+
+    const trace = createPheromoneTraceState(writeSettings, "Find memories about search exposure tracing");
+    addSearchExposures(trace, search, "portia_search");
+    const flushed = flushPheromoneTraceState(db, writeSettings, trace);
+    assert.equal(flushed.exposed, 1);
+    assert.equal(flushed.ignored, 1);
+
+    const pheromone = db.getMemoryPheromone(memory.id);
+    assert.equal(pheromone.exposedCount, 1);
+    assert.equal(pheromone.ignoredCount, 1);
+    assert.equal(pheromone.strength, 0);
+
+    const exposed = db.getTraceEventsForMemory(memory.id).find((event) => event.eventType === "exposed");
+    assert.ok(exposed);
+    const payload = JSON.parse(exposed.payloadJson);
+    assert.equal(payload.source, "portia_search");
+    assert.equal(payload.query, "search exposure tracing");
+    assert.equal(payload.status, "active");
+    assert.equal(payload.matchMode, "any");
+    assert.equal(payload.rank, search.hits.findIndex((hit) => hit.memory.id === memory.id));
   } finally {
     db.close();
     fs.rmSync(project, { recursive: true, force: true });
@@ -1587,6 +1639,135 @@ test("autopilot context renders a bounded Portia Project Context pack", () => {
   }
 });
 
+test("autopilot search classifier distinguishes high, medium, audit, and routine prompts", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.writeFileSync(path.join(project, "src", "db.ts"), "export const schema = true;\n");
+
+  try {
+    const base = settings(project, dbPath);
+
+    const high = buildAutopilotSearchSuggestion(base, "Did we already decide how search pagination should work?", project);
+    assert.equal(high?.confidence, "high");
+    assert.equal(high?.status, "active");
+    assert.equal(high?.matchMode, "any");
+    assert.equal(high?.orderBy, "relevance");
+    assert.equal(high?.limit, 5);
+    assert.match(high?.query ?? "", /search/);
+    assert.doesNotMatch(high?.query ?? "", /Did we already/i);
+
+    const explicit = buildAutopilotSearchSuggestion(base, "Find memories mentioning `maxSenseResults`.", project);
+    assert.equal(explicit?.confidence, "high");
+    assert.match(explicit?.query ?? "", /maxSenseResults/);
+
+    const audit = buildAutopilotSearchSuggestion(base, "Search stale or superseded memories about visibility repair.", project);
+    assert.equal(audit?.confidence, "high");
+    assert.equal(audit?.status, "any");
+    assert.equal(audit?.query, "visibility repair");
+
+    const medium = buildAutopilotSearchSuggestion(base, "Any prior rationale for the auto search setting?", project);
+    assert.equal(medium?.confidence, "medium");
+    assert.equal(medium?.status, "active");
+    assert.equal(shouldBuildAutopilotSearchPreview(base, medium), false);
+
+    const scoped = buildAutopilotSearchSuggestion(base, "Did we already decide anything about src/db.ts migrations?", project);
+    assert.equal(scoped?.confidence, "high");
+    assert.equal(scoped?.scopePath, "src/db.ts");
+
+    assert.equal(buildAutopilotSearchSuggestion(base, "Fix the failing test in `src/db.ts`.", project), undefined);
+    assert.equal(buildAutopilotSearchSuggestion(base, "Read `src/config.ts` and summarize it.", project), undefined);
+    assert.equal(buildAutopilotSearchSuggestion(base, "Run typecheck.", project), undefined);
+    assert.equal(buildAutopilotSearchSuggestion(base, "Implement repair logic in src/repair.ts.", project), undefined);
+    assert.equal(buildAutopilotSearchSuggestion(base, "Fix stale state handling in src/repair.ts.", project), undefined);
+    assert.equal(buildAutopilotSearchSuggestion(base, "Update deleted-row handling in src/db.ts.", project), undefined);
+    assert.equal(buildAutopilotSearchSuggestion(settings(project, dbPath, { autoSearchMode: "off" }), "Find memories mentioning search.", project), undefined);
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("autopilot search suggestion rendering is concrete and tool-aware", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+
+  try {
+    const suggestion = buildAutopilotSearchSuggestion(settings(project, dbPath), "Find memories mentioning `maxSenseResults`.", project);
+    assert.ok(suggestion);
+
+    const rendered = renderAutopilotSearchSuggestion(suggestion);
+    assert.match(rendered ?? "", /## Portia historical recall suggestion/);
+    assert.match(rendered ?? "", /portia_search/);
+    assert.match(rendered ?? "", /maxSenseResults/);
+    assert.match(rendered ?? "", /status: "active"/);
+    assert.match(rendered ?? "", /limit: 5/);
+
+    assert.equal(renderAutopilotSearchSuggestion(suggestion, { toolAvailable: false }), undefined);
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("autopilot search preview is compact, bounded, and gated by mode and confidence", () => {
+  const project = tempProject();
+  const dbPath = path.join(project, ".pi", "portia", "portia.sqlite");
+  const db = openPortiaDatabase(dbPath);
+
+  try {
+    const first = db.createMemory({
+      scopePath: "pi-portia",
+      kind: "decision",
+      title: "Automatic search assist decision",
+      body: "Automatic search assist should use compact historical recall previews for high confidence prompts.",
+      importance: 8,
+      confidence: 100,
+    }).memory;
+    db.createMemory({
+      scopePath: "pi-portia/src/autopilot.ts",
+      kind: "gotcha",
+      title: "Search preview renderer gotcha",
+      body: "Automatic search assist previews must omit DB paths, page metadata, cursors, and no-hit sections.",
+      importance: 6,
+      confidence: 100,
+    });
+
+    const assist = settings(project, dbPath, { autoSearchMaxResults: 2, autoSearchMaxChars: 700 });
+    const high = buildAutopilotSearchSuggestion(assist, "Did we already decide how automatic search assist previews should work?", project);
+    assert.equal(high?.confidence, "high");
+    assert.equal(shouldBuildAutopilotSearchPreview(assist, high), true);
+
+    const preview = buildAutopilotSearchPreviewResult(db, assist, "Did we already decide how automatic search assist previews should work?", project, { suggestion: high });
+    assert.ok(preview);
+    assert.match(preview.rendered, /## Portia Historical Recall Preview/);
+    assert.match(preview.rendered, /Automatic search assist decision/);
+    assert.doesNotMatch(preview.rendered, /DB:/);
+    assert.doesNotMatch(preview.rendered, /nextCursor|Page|No Portia memories matched/);
+    assert.equal(preview.rendered.length <= 700, true);
+    assert.equal(preview.result.hits.length <= 2, true);
+
+    const mediumPrompt = "Any prior rationale for automatic search assist settings?";
+    const medium = buildAutopilotSearchSuggestion(assist, mediumPrompt, project);
+    assert.equal(medium?.confidence, "medium");
+    assert.equal(buildAutopilotSearchPreviewResult(db, assist, mediumPrompt, project, { suggestion: medium }), undefined);
+
+    const contextPreview = buildAutopilotSearchPreviewResult(db, settings(project, dbPath, { autoSearchMode: "context" }), mediumPrompt, project);
+    assert.ok(contextPreview);
+
+    const excludedPreview = buildAutopilotSearchPreviewResult(db, assist, "Did we already decide how automatic search assist previews should work?", project, {
+      suggestion: high,
+      excludeMemoryIds: [first.id],
+    });
+    assert.ok(excludedPreview);
+    assert.doesNotMatch(excludedPreview.rendered, new RegExp(first.id));
+
+    const noHits = buildAutopilotSearchPreviewResult(db, assist, "Did we already decide how zz-nonexistent-topic should work?", project);
+    assert.equal(noHits, undefined);
+  } finally {
+    db.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("resolvePortiaSettings parses autopilot settings and caps auto sense limits", () => {
   const project = tempProject();
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-portia-agent-"));
@@ -1600,6 +1781,9 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
         autoSense: false,
         autoSenseMaxResults: 99,
         autoSenseMaxChars: 99_999,
+        autoSearchMode: "context",
+        autoSearchMaxResults: 99,
+        autoSearchMaxChars: 99_999,
         searchDefaultLimit: 600,
         searchMaxResults: 999,
         listDefaultLimit: 90,
@@ -1622,6 +1806,9 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
     assert.equal(resolved.autoSense, false);
     assert.equal(resolved.autoSenseMaxResults, 12);
     assert.equal(resolved.autoSenseMaxChars, 12_000);
+    assert.equal(resolved.autoSearchMode, "context");
+    assert.equal(resolved.autoSearchMaxResults, 12);
+    assert.equal(resolved.autoSearchMaxChars, 8_000);
     assert.equal(resolved.searchDefaultLimit, 500);
     assert.equal(resolved.searchMaxResults, 500);
     assert.equal(resolved.listDefaultLimit, 70);
@@ -1634,6 +1821,33 @@ test("resolvePortiaSettings parses autopilot settings and caps auto sense limits
     assert.equal(resolved.pheromoneIgnoredWeight, -0.1);
     assert.equal(resolved.pheromoneWorkerPolicy, "low");
     assert.equal(resolved.traceRetentionDays, 400);
+  } finally {
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+    fs.rmSync(agentDir, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("resolvePortiaSettings ignores invalid auto search settings", () => {
+  const project = tempProject();
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-portia-agent-"));
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+  try {
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({
+      portia: {
+        autoSearchMode: "loud",
+        autoSearchMaxResults: -1,
+        autoSearchMaxChars: 0,
+      },
+    }));
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+
+    const resolved = resolvePortiaSettings(project);
+    assert.equal(resolved.autoSearchMode, "assist");
+    assert.equal(resolved.autoSearchMaxResults, 5);
+    assert.equal(resolved.autoSearchMaxChars, 900);
   } finally {
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir;

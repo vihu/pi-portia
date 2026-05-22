@@ -38,6 +38,9 @@ const settings = {
   autoSense: true,
   autoSenseMaxResults: 5,
   autoSenseMaxChars: 2500,
+  autoSearchMode: "assist",
+  autoSearchMaxResults: 5,
+  autoSearchMaxChars: 900,
   enablePheromones: true,
   pheromoneRanking: true,
   pheromoneHalfLifeDays: 30,
@@ -182,6 +185,7 @@ test("renderStatus exposes maintenance-relevant settings", () => {
   assert.match(statusOutput, /^# Portia Status/);
   assert.match(statusOutput, /Schema: 3/);
   assert.match(statusOutput, /FTS: available/);
+  assert.match(statusOutput, /Autopilot search: assist \(5 memories, 900 chars\)/);
   assert.match(statusOutput, /Pheromone worker policy: off/);
   assert.match(statusOutput, /- active: 2/);
   assert.doesNotMatch(statusOutput, /\[object Object\]/);

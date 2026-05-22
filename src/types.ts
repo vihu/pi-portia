@@ -25,6 +25,7 @@ export type PortiaDuplicatePolicy = "warn" | "blockExact";
 export type PortiaRepairAction = "stale" | "delete" | "reactivate";
 export type PortiaRepairSkipReason = "readonly" | "confirm" | "noop";
 export type PheromoneWorkerPolicy = "off" | "low" | "write";
+export type PortiaAutoSearchMode = "off" | "suggest" | "assist" | "context";
 export type PheromoneTraceEventType =
   | "exposed"
   | "followed_scope"
@@ -56,6 +57,9 @@ export interface PortiaSettings {
   autoSense: boolean;
   autoSenseMaxResults: number;
   autoSenseMaxChars: number;
+  autoSearchMode: PortiaAutoSearchMode;
+  autoSearchMaxResults: number;
+  autoSearchMaxChars: number;
   enablePheromones: boolean;
   pheromoneRanking: boolean;
   pheromoneHalfLifeDays: number;

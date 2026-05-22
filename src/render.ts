@@ -597,6 +597,7 @@ export function renderStatus(settings: PortiaSettings, stats: PortiaStats): stri
   lines.push(`Autopilot guidance: ${settings.autoPromptGuidance}`);
   lines.push(`Autopilot record guidance: ${settings.autoRecordGuidance}`);
   lines.push(`Autopilot sense: ${settings.autoSense ? `enabled (${settings.autoSenseMaxResults} memories, ${settings.autoSenseMaxChars} chars)` : "disabled"}`);
+  lines.push(`Autopilot search: ${settings.autoSearchMode} (${settings.autoSearchMaxResults} memories, ${settings.autoSearchMaxChars} chars)`);
   lines.push(`Pheromones: ${settings.enablePheromones ? "enabled" : "disabled"}, ranking ${settings.pheromoneRanking ? "on" : "off"}`);
   lines.push(`Pheromone worker policy: ${settings.pheromoneWorkerPolicy}`);
   lines.push(`Pheromone half-life: ${settings.pheromoneHalfLifeDays} days`);

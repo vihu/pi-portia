@@ -95,7 +95,7 @@ The database is the complete Portia data store for the checkout. It is intended 
 
 ## Usage
 
-Portia includes a small autopilot layer. On each agent turn it can add turn-local guidance and a bounded `Portia Project Context` pack selected from existing memories by prompt/path. This should make Portia useful during normal work without adding persistent boilerplate messages to the session.
+Portia includes a small autopilot layer. On each agent turn it can add turn-local guidance, a bounded `Portia Project Context` pack selected from existing memories by prompt/path, and an intent-gated historical recall assist for prompts that clearly ask about prior decisions, evidence, or memory history. This should make Portia useful during normal work without adding persistent boilerplate messages to the session.
 
 You can still run explicit commands:
 
@@ -146,6 +146,8 @@ For more detailed agent guidance, see [`docs/agent-usage.md`](docs/agent-usage.m
 
 Use `portia_search`/`/portia-search` for explicit keyword search across memories, especially in long sessions where `portia_sense` is intentionally too bounded. Search is the right tool for prior decisions, old validation notes, package names, error strings, and broad concept recall. Search supports status, kind, scope, ordering, match mode, substring fallback, configurable page limits, and opaque cursor pagination. Use the returned `nextCursor` with the same query and filters to continue browsing additional pages; cursors validate against the original query/filter fingerprint and do not store the full query.
 
+Autopilot can also assist search-shaped turns. In default `autoSearchMode: "assist"`, medium-confidence historical prompts receive a concrete `portia_search` suggestion, while high-confidence prompts can receive a tiny `Portia Historical Recall Preview` generated from internal search. The preview is bounded and pointer-only; it omits DB paths, cursor metadata, no-hit sections, and full provenance. Routine path/edit/test prompts should continue to rely on `portia_sense` and should not receive search preview noise.
+
 Search query text is plain input, not raw FTS syntax. Portia quotes search terms before sending them to SQLite FTS5, so code-like literals such as `/portia-list`, `src/config.ts`, `foo:bar`, `-6`, and words like `AND`/`OR` are treated safely instead of as operators. Default `matchMode` is `all`; use `match any` for broader recall or `match phrase` for an exact phrase. Generated `search_terms` help component searches find code/camelCase text such as `maxSenseResults` from `max sense results`.
 
 Use `portia_list`/`/portia-list` for structured inventory browsing/auditing. List keeps `query` as a simple case-insensitive substring inventory filter over memory title, body, scope, kind, and provenance; use `portia_search` for FTS relevance ranking and snippets. List output includes page metadata and `nextCursor` when more rows are available. Repeat the same status/scope/kind/query filters with the cursor to continue browsing. In slash-command syntax, put `cursor <nextCursor>` before `query <text>` because `query` consumes the rest of the command.
@@ -190,6 +192,9 @@ Global settings live in Pi's agent settings file. Project settings live in `.pi/
     "autoSense": true,
     "autoSenseMaxResults": 5,
     "autoSenseMaxChars": 2500,
+    "autoSearchMode": "assist",
+    "autoSearchMaxResults": 5,
+    "autoSearchMaxChars": 900,
     "enablePheromones": true,
     "pheromoneRanking": true,
     "pheromoneHalfLifeDays": 30,
@@ -236,8 +241,20 @@ Autopilot settings:
 - `autoSense`: internally retrieve a bounded context pack for each turn
 - `autoSenseMaxResults`: max memories in that pack, capped at 12
 - `autoSenseMaxChars`: max rendered pack size, capped at 12000
+- `autoSearchMode`: historical recall assist mode, one of `off`, `suggest`, `assist`, or `context`; default `assist`
+- `autoSearchMaxResults`: max search hits in automatic preview/suggestion limits, default `5`, capped at 12
+- `autoSearchMaxChars`: max rendered automatic search preview size, default `900`, capped at 8000
 
-Autopilot does not run a background summarizer or silently write semantic memories by itself. It makes the agent more likely to sense and record intentionally.
+Mode behavior:
+
+| Mode      | Behavior                                                                                                                                                                           |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `off`     | No search-intent suggestion and no internal historical search preview.                                                                                                             |
+| `suggest` | Detected historical/broad-memory prompts append a concrete `portia_search` suggestion only; no internal search is performed.                                                       |
+| `assist`  | Default middle ground: medium-confidence prompts get the suggestion only; high-confidence prior-decision/provenance/audit prompts get a tiny internal preview plus the suggestion. |
+| `context` | Stronger opt-in: detected medium/high confidence prompts can receive compact internal search preview plus the suggestion.                                                          |
+
+Autopilot does not run a background summarizer or silently write semantic memories by itself. It makes the agent more likely to sense, search, and record intentionally.
 
 Search and browse settings:
 
