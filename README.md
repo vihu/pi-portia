@@ -8,7 +8,7 @@ Portia is a project-local, inspectable memory layer backed by SQLite. It stores 
 
 Beta.
 
-Portia is usable for day-to-day local project memory. The core workflows are implemented and validated, but the public tool/command surface and maintenance workflows may still change before `v1.0.0`.
+Portia is usable for day-to-day local project memory. The core workflows are implemented and validated. In the `v1.x` line, the documented public surface follows Semantic Versioning; renderer wording, diagnostics, ranking weights, and maintenance ergonomics may continue to evolve in compatible minor or patch releases.
 
 Implemented now:
 
@@ -39,10 +39,10 @@ Implemented now:
 - parser, renderer, tool-schema, and migration fixture test coverage
 - changelog plus release, semver, migration, and package checklist documentation
 
-V1 hardening roadmap:
+Near-term hardening roadmap:
 
-- additional search/list polish for long-session ergonomics
-- v1 release-candidate audit and smoke testing
+- additional search/list/autopilot polish for long-session ergonomics
+- release audit and smoke testing on each publish
 
 Deferred until measured need:
 

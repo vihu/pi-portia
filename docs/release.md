@@ -106,16 +106,17 @@ Confirm the package uses current Pi package names:
 
 ### 5. Bump version
 
-For a beta hardening release, prefer:
+For a v1-compatible minor or patch release, use the target SemVer version:
 
 ```bash
-npm -C pi-portia version 0.2.0 --no-git-tag-version
+npm -C pi-portia version 1.1.0 --no-git-tag-version
+npm -C pi-portia version 1.1.1 --no-git-tag-version
 ```
 
-For v1 prereleases or release candidates, use a prerelease version such as:
+For prereleases or release candidates, use a prerelease version such as:
 
 ```bash
-npm -C pi-portia version 1.0.0-rc.1 --no-git-tag-version
+npm -C pi-portia version 1.2.0-rc.1 --no-git-tag-version
 ```
 
 Re-run validation after the version bump because `package.json` and `package-lock.json` change.
@@ -126,7 +127,7 @@ Use conventional commits. Example messages:
 
 ```text
 docs(portia): document release and semver policy
-chore(portia): release 0.2.0
+chore(portia): release 1.1.0
 ```
 
 Create tags only after validation is green and the release commit is final.

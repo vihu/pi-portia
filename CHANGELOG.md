@@ -6,6 +6,16 @@ This project follows Semantic Versioning after `v1.0.0`. Before v1, minor releas
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-23
+
+### Added
+
+- Intent-gated search assist for historical/broad-memory prompts.
+
+### Changed
+
+- Refresh README and release checklist wording for the `v1.x` release line.
+
 ## [1.0.0] - 2026-05-17
 
 ### Added
